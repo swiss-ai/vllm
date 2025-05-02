@@ -87,6 +87,7 @@ AITER_MODEL_LIST = [
             marks=[pytest.mark.cpu_model,
                    large_gpu_mark(min_gb=48)],
         )
+        pytest.param("Saesara/swissai"),  # swissai
     ])
 @pytest.mark.parametrize("max_tokens", [32])
 @pytest.mark.parametrize("num_logprobs", [5])
