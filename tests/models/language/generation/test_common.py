@@ -88,6 +88,7 @@ AITER_MODEL_LIST = [
             "TitanML/tiny-mixtral",  # mixtral
             marks=[pytest.mark.cpu_model],
         )
+        pytest.param("Saesara/swissai"),  # swissai
     ])
 @pytest.mark.parametrize("max_tokens", [32])
 @pytest.mark.parametrize("num_logprobs", [5])
