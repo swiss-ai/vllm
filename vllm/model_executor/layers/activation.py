@@ -14,6 +14,8 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
 
+from torch._dynamo import allow_in_graph
+import warnings
 
 @CustomOp.register("xielu")
 class XIELU(CustomOp):
@@ -32,14 +34,26 @@ class XIELU(CustomOp):
         self.beta = beta
         self.eps = torch.tensor(eps, dtype=torch.bfloat16, device='cuda')
 
+        self._forward_method = self.forward_native
         if current_platform.is_cuda_alike():
-            # TODO CUDA implementation under development, using forward_native for now
-            self._forward_method = self.forward_native
-        elif current_platform.is_cpu():
-            self._forward_method = self.forward_native
+            try:
+                from xielu.ops.wrappers import XIELU as XIELUCUDA
+                # Create CUDA instance without Dynamo interference first
+                self._xielu_cuda = XIELUCUDA(
+                    alpha_p=self.alpha_p,
+                    alpha_n=self.alpha_n,
+                    beta=self.beta,
+                    eps=self.eps
+                )
+                
+                # Mark the forward method as Dynamo-compatible
+                self.forward_cuda = allow_in_graph(self._xielu_cuda.forward)
+                self._forward_method = self.forward_cuda
+                
+            except Exception as e:
+                warnings.warn(f"CUDA xIELU not available: {e}")
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        # TODO optimize to precompute
         alpha_p = F.softplus(self.alpha_p)
         alpha_n = self.beta + F.softplus(self.alpha_n)
         return torch.where(
@@ -48,8 +62,8 @@ class XIELU(CustomOp):
             alpha_n * torch.expm1(torch.min(x, self.eps)) - alpha_n * x + self.beta * x
         )
 
-    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        return
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_method(x)
 
 
 @CustomOp.register("fatrelu_and_mul")
