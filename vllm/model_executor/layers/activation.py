@@ -15,6 +15,10 @@ from vllm.model_executor.utils import set_weight_attrs
 from vllm.platforms import current_platform
 from vllm.utils import LazyDict
 
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
+
 
 @CustomOp.register("xielu")
 class XIELU(CustomOp):
@@ -23,13 +27,14 @@ class XIELU(CustomOp):
     If the user has installed the nickjbrowning/XIELU wheel, we import xIELU CUDA
     Otherwise, we emit a single warning and use xIELU Python
     """
+
     def __init__(
-        self,
-        alpha_p_init: float = 0.8,
-        alpha_n_init: float = 0.8,
-        beta: float = 0.5,
-        eps: float = -1e-6,
-        with_vector_loads: bool = True,
+            self,
+            alpha_p_init: float = 0.8,
+            alpha_n_init: float = 0.8,
+            beta: float = 0.5,
+            eps: float = -1e-6,
+            with_vector_loads: bool = True,
     ) -> None:
         super().__init__()
         # Initialize parameters
@@ -37,7 +42,7 @@ class XIELU(CustomOp):
             torch.log(torch.exp(torch.tensor(alpha_p_init)) - 1).unsqueeze(0))
         self.alpha_n = nn.Parameter(
             torch.log(torch.exp(torch.tensor(alpha_n_init - beta)) - 1).unsqueeze(0))
-        
+
         # Register beta and eps as buffers (fixed tensors)
         self.register_buffer('beta', torch.tensor(beta), persistent=False)
         self.register_buffer('eps', torch.tensor(eps), persistent=False)
@@ -47,16 +52,17 @@ class XIELU(CustomOp):
         self._xielu_cuda_fn = None  # Will be set if CUDA available
         try:
             import xielu.ops  # noqa: F401
-
             self._xielu_cuda_obj = torch.classes.xielu.XIELU()
+            self._xielu_cuda_fn = self._xielu_cuda
             try:
                 from torch._dynamo import allow_in_graph
                 self._xielu_cuda_fn = allow_in_graph(self._xielu_cuda)
             except Exception as err:
-                print(f"Could not enable torch._dynamo for xIELU ({err}) - this may result in slower performance.")
+                logger.warning(
+                    f"Could not enable torch._dynamo for xIELU ({err}) - this may result in slower performance.")
         except Exception as err:
-            print(f"CUDA-fused xIELU not available ({err}) - using Python implementation. "
-                  "Install with: pip install git+https://github.com/nickjbrowning/XIELU")
+            logger.warning(f"CUDA-fused xIELU not available ({err}) - using Python implementation. "
+                           "Install with: pip install git+https://github.com/nickjbrowning/XIELU")
 
     def _xielu_python(self, x: torch.Tensor) -> torch.Tensor:
         alpha_p = F.softplus(self.alpha_p)
@@ -86,7 +92,7 @@ class XIELU(CustomOp):
         return result.view(original_shape)
 
     def forward(self, input: torch.Tensor) -> torch.Tensor:
-        if self._xielu_cuda_obj is not None and input.is_cuda and not torch._dynamo.is_compiling():
+        if self._xielu_cuda_fn is not None and input.is_cuda and not torch._dynamo.is_compiling():
             return self._xielu_cuda_fn(input)
         return self._xielu_python(input)
 
@@ -121,7 +127,7 @@ class FatreluAndMul(CustomOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x, self.threshold)
         return out
@@ -155,14 +161,14 @@ class SiluAndMul(CustomOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
@@ -203,7 +209,7 @@ class MulAndSilu(CustomOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
@@ -298,14 +304,14 @@ class GeluAndMul(CustomOp):
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
 
     def forward_xpu(self, x: torch.Tensor) -> torch.Tensor:
         d = x.shape[-1] // 2
-        output_shape = (x.shape[:-1] + (d, ))
+        output_shape = (x.shape[:-1] + (d,))
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         self.op(out, x)
         return out
@@ -415,11 +421,11 @@ class ScaledActivation(nn.Module):
     """
 
     def __init__(
-        self,
-        act_module: nn.Module,
-        intermediate_size: int,
-        input_is_parallel: bool = True,
-        params_dtype: Optional[torch.dtype] = None,
+            self,
+            act_module: nn.Module,
+            intermediate_size: int,
+            input_is_parallel: bool = True,
+            params_dtype: Optional[torch.dtype] = None,
     ):
         super().__init__()
         self.act = act_module
@@ -452,21 +458,21 @@ class ScaledActivation(nn.Module):
 
 _ACTIVATION_REGISTRY = LazyDict({
     "gelu":
-    lambda: nn.GELU(),
+        lambda: nn.GELU(),
     "gelu_fast":
-    lambda: FastGELU(),
+        lambda: FastGELU(),
     "gelu_new":
-    lambda: NewGELU(),
+        lambda: NewGELU(),
     "gelu_pytorch_tanh":
-    lambda: nn.GELU(approximate="tanh"),
+        lambda: nn.GELU(approximate="tanh"),
     "relu":
-    lambda: nn.ReLU(),
+        lambda: nn.ReLU(),
     "relu2":
-    lambda: ReLUSquaredActivation(),
+        lambda: ReLUSquaredActivation(),
     "silu":
-    lambda: nn.SiLU(),
+        lambda: nn.SiLU(),
     "quick_gelu":
-    lambda: QuickGELU(),
+        lambda: QuickGELU(),
 })
 
 
