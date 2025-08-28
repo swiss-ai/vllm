@@ -23,13 +23,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Inference-only Apertus model compatible with HuggingFace weights."""
+"""Inference-only SwissAI model compatible with HuggingFace weights."""
 from collections.abc import Iterable
 from typing import Any, Optional, Union
 
 import torch
 from torch import nn
-from transformers import ApertusConfig
+from transformers import SwissAIConfig
 
 from vllm.attention import Attention, AttentionType
 from vllm.attention.layers.encoder_only_attention import EncoderOnlyAttention
@@ -58,7 +58,7 @@ from .utils import (AutoWeightsLoader, PPMissingLayer, extract_layer_index,
                     maybe_prefix)
 
 
-class ApertusMLP(nn.Module):
+class SwissAIMLP(nn.Module):
 
     def __init__(
         self,
@@ -98,11 +98,11 @@ class ApertusMLP(nn.Module):
         return x
 
 
-class ApertusAttention(nn.Module):
+class SwissAIAttention(nn.Module):
 
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -207,12 +207,12 @@ class ApertusAttention(nn.Module):
         output, _ = self.o_proj(attn_output)
         return output
 
-    def _init_rotary_emb(self, config: ApertusConfig,
+    def _init_rotary_emb(self, config: SwissAIConfig,
                          rope_scaling: Optional[dict[str, Any]],
                          quant_config: Optional[QuantizationConfig]) -> None:
         is_neox_style = True
         is_gguf = quant_config and quant_config.get_name() == "gguf"
-        if is_gguf and config.model_type == "apertus":
+        if is_gguf and config.model_type == "swissai":
             is_neox_style = False
 
         self.rotary_emb = get_rope(
@@ -226,11 +226,11 @@ class ApertusAttention(nn.Module):
         )
 
 
-class ApertusDecoderLayer(nn.Module):
+class SwissAIDecoderLayer(nn.Module):
 
     def __init__(
         self,
-        config: ApertusConfig,
+        config: SwissAIConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -254,7 +254,7 @@ class ApertusDecoderLayer(nn.Module):
         if hasattr(config, 'qkv_bias'):
             attention_bias = config.qkv_bias
 
-        # Apertus defaults to causal attention as it is a decoder-only model.
+        # SwissAI defaults to causal attention as it is a decoder-only model.
         # You can override the HF config with `is_causal=False` to enable
         # bidirectional attention, which is used in some embedding models
         # (e.g. parasail-ai/GritLM-7B-vllm)
@@ -263,7 +263,7 @@ class ApertusDecoderLayer(nn.Module):
         else:
             attn_type = AttentionType.ENCODER_ONLY
 
-        self.self_attn = ApertusAttention(
+        self.self_attn = SwissAIAttention(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -279,7 +279,7 @@ class ApertusDecoderLayer(nn.Module):
             prefix=f"{prefix}.self_attn",
             attn_type=attn_type,
         )
-        self.mlp = ApertusMLP(
+        self.mlp = SwissAIMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
@@ -316,13 +316,13 @@ class ApertusDecoderLayer(nn.Module):
 
 
 @support_torch_compile
-class ApertusModel(nn.Module):
+class SwissAIModel(nn.Module):
 
     def __init__(self,
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 layer_type: type[nn.Module] = ApertusDecoderLayer):
+                 layer_type: type[nn.Module] = SwissAIDecoderLayer):
         super().__init__()
 
         config = vllm_config.model_config.hf_config
@@ -471,7 +471,7 @@ class ApertusModel(nn.Module):
         return loaded_params
 
 
-class ApertusForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
+class SwissAIForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
 
     # LoRA specific attributes
@@ -485,7 +485,7 @@ class ApertusForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                  *,
                  vllm_config: VllmConfig,
                  prefix: str = "",
-                 layer_type: type[nn.Module] = ApertusDecoderLayer):
+                 layer_type: type[nn.Module] = SwissAIDecoderLayer):
         super().__init__()
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
@@ -538,8 +538,8 @@ class ApertusForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
     def _init_model(self,
                     vllm_config: VllmConfig,
                     prefix: str = "",
-                    layer_type: type[nn.Module] = ApertusDecoderLayer):
-        return ApertusModel(vllm_config=vllm_config,
+                    layer_type: type[nn.Module] = SwissAIDecoderLayer):
+        return SwissAIModel(vllm_config=vllm_config,
                             prefix=prefix,
                             layer_type=layer_type)
 
