@@ -25,16 +25,18 @@
 # limitations under the License.
 """Inference-only Apertus model compatible with HuggingFace weights."""
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping, Sequence
 from itertools import islice
 
 import torch
 from torch import nn
-from transformers import ApertusConfig
+from transformers import ApertusConfig, BatchFeature
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
 from vllm.model_executor.layers.activation import XIELU
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -53,14 +55,36 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
+from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.multimodal.inputs import (
+    MultiModalFieldConfig,
+    MultiModalKwargsItems,
+)
+from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
+from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    ProcessorInputs,
+    PromptReplacement,
+    PromptUpdate,
+    TimingContext,
+)
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
+from .apertus_utils import ApertusImageTokenizer
 from .interfaces import (
     EagleModelMixin,
+    MultiModalEmbeddings,
     SupportsEagle,
     SupportsEagle3,
     SupportsLoRA,
+    SupportsMultiModal,
     SupportsPP,
 )
 from .utils import (
@@ -72,6 +96,183 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+
+class ApertusProcessingInfo(BaseProcessingInfo):
+    def get_hf_config(self) -> ApertusConfig:
+        return self.ctx.get_hf_config(ApertusConfig)
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"image": None}
+
+
+class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        num_images = mm_counts.get("image", 0)
+        return ApertusImageTokenizer.DEFAULT_IMAGE_PLACEHOLDER * num_images
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
+    ) -> MultiModalDataDict:
+        del seq_len
+        num_images = mm_counts.get("image", 0)
+        image_overrides = mm_options.get("image")
+        max_side = int(ApertusImageTokenizer.DEFAULT_MAX_PIXELS**0.5)
+        return {
+            "image": self._get_dummy_images(
+                width=max_side,
+                height=max_side,
+                num_images=num_images,
+                overrides=image_overrides,
+            )
+        }
+
+
+class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo]):
+    def __init__(
+        self,
+        info: ApertusProcessingInfo,
+        dummy_inputs: BaseDummyInputsBuilder[ApertusProcessingInfo],
+        *,
+        cache: object | None = None,
+    ) -> None:
+        super().__init__(info, dummy_inputs, cache=cache)
+        self.image_tokenizer = ApertusImageTokenizer()
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        return {}
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptUpdate]:
+        return []
+
+    @staticmethod
+    def _find_image_placeholders(prompt: str, aliases: Sequence[str]) -> list[str]:
+        placeholders: list[tuple[int, str]] = []
+        for alias in aliases:
+            start = 0
+            while True:
+                idx = prompt.find(alias, start)
+                if idx < 0:
+                    break
+                placeholders.append((idx, alias))
+                start = idx + len(alias)
+
+        placeholders.sort(key=lambda item: item[0])
+        return [placeholder for _, placeholder in placeholders]
+
+    def _validate_only_image_inputs(self, mm_items: MultiModalDataItems) -> None:
+        unsupported = [modality for modality in mm_items if modality != "image"]
+        if unsupported:
+            raise ValueError(
+                "Apertus multimodal preprocessing currently supports only "
+                f"image inputs. Unsupported modalities: {unsupported}"
+            )
+
+    def _tokenize_text(
+        self,
+        text: str,
+        tokenization_kwargs: Mapping[str, object],
+    ) -> list[int]:
+        tokenizer = self.info.get_tokenizer()
+        token_ids = tokenizer.encode(text, **dict(tokenization_kwargs))
+        return list(token_ids)
+
+    def apply(
+        self,
+        inputs: ProcessorInputs,
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput:
+        self._validate_only_image_inputs(inputs.mm_data_items)
+
+        tokenizer = self.info.get_tokenizer()
+        prompt_text = (
+            inputs.prompt
+            if isinstance(inputs.prompt, str)
+            else tokenizer.decode(inputs.prompt)
+        )
+
+        if inputs.mm_data_items.get_count("image", strict=False) == 0:
+            with timing_ctx.record("tokenize"):
+                prompt_token_ids = self._tokenize_text(
+                    prompt_text,
+                    inputs.tokenization_kwargs,
+                )
+            return mm_input(
+                prompt_token_ids=prompt_token_ids,
+                mm_kwargs=MultiModalKwargsItems({}),
+                mm_hashes={},
+                mm_placeholders={},
+                prompt=prompt_text,
+            )
+
+        with timing_ctx.record("encode_apertus_images"):
+            image_items = inputs.mm_data_items.get_items("image", ImageProcessorItems)
+            images = [image_items[idx] for idx in range(len(image_items))]
+            image_prompts = self.image_tokenizer.encode_images(
+                images,
+                tokenizer=tokenizer,
+                mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
+            )
+
+        aliases = self.image_tokenizer.placeholder_aliases(
+            tokenizer, inputs.hf_processor_mm_kwargs
+        )
+        placeholders = self._find_image_placeholders(prompt_text, aliases)
+        if len(placeholders) != len(image_prompts):
+            raise ValueError(
+                "Apertus image placeholder/input mismatch: found "
+                f"{len(placeholders)} placeholder(s) in the prompt using aliases "
+                f"{aliases}, but received {len(image_prompts)} image input(s)."
+            )
+
+        prompt_updates = self._bind_and_group_updates(
+            [
+                PromptReplacement(
+                    modality="image",
+                    target=lambda item_idx: placeholders[item_idx],
+                    replacement=lambda item_idx: image_prompts[item_idx],
+                )
+            ],
+            {"image": len(image_prompts)},
+        )
+
+        with timing_ctx.record("apply_prompt_updates"):
+            merged_prompt, match_result = self._apply_text_matches(
+                prompt_text, prompt_updates
+            )
+
+        if not all(
+            update_idx is not None
+            for update_idxs in match_result.values()
+            for update_idx in update_idxs
+        ):
+            raise RuntimeError("Failed to replace all Apertus image placeholders.")
+
+        with timing_ctx.record("tokenize"):
+            prompt_token_ids = self._tokenize_text(
+                merged_prompt,
+                inputs.tokenization_kwargs,
+            )
+
+        return mm_input(
+            prompt_token_ids=prompt_token_ids,
+            mm_kwargs=MultiModalKwargsItems({}),
+            mm_hashes={},
+            mm_placeholders={},
+            prompt=merged_prompt,
+        )
 
 
 class ApertusMLP(nn.Module):
@@ -401,8 +602,18 @@ class ApertusModel(nn.Module, EagleModelMixin):
         return hidden_states
 
 
+@MULTIMODAL_REGISTRY.register_processor(
+    ApertusMultiModalProcessor,
+    info=ApertusProcessingInfo,
+    dummy_inputs=ApertusDummyInputsBuilder,
+)
 class ApertusForCausalLM(
-    nn.Module, SupportsLoRA, SupportsPP, SupportsEagle, SupportsEagle3
+    nn.Module,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsMultiModal,
 ):
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={
@@ -468,7 +679,34 @@ class ApertusForCausalLM(
             vllm_config=vllm_config, prefix=prefix, layer_type=layer_type
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    @classmethod
+    def get_placeholder_str(cls, modality: str, i: int) -> str | None:
+        if modality == "image":
+            return ApertusImageTokenizer.DEFAULT_IMAGE_PLACEHOLDER
+
+        raise ValueError(f"Unsupported modality: {modality}")
+
+    def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
+        if kwargs:
+            raise ValueError(
+                "Apertus image inputs are serialized to token IDs during "
+                "preprocessing and should not reach the model as multimodal "
+                f"kwargs. Got keys: {sorted(kwargs)}"
+            )
+        return []
+
+    def embed_input_ids(
+        self,
+        input_ids: torch.Tensor,
+        multimodal_embeddings: MultiModalEmbeddings | None = None,
+        *,
+        is_multimodal: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+            raise ValueError(
+                "Apertus does not merge multimodal embeddings in the model. "
+                "Images must be serialized to token IDs by the processor."
+            )
         return self.model.embed_input_ids(input_ids)
 
     def forward(
@@ -477,7 +715,13 @@ class ApertusForCausalLM(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
+        **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
+        if kwargs:
+            raise ValueError(
+                "Unexpected multimodal kwargs for Apertus forward: "
+                f"{sorted(kwargs)}"
+            )
         model_output = self.model(
             input_ids, positions, intermediate_tensors, inputs_embeds
         )
