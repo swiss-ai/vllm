@@ -1,0 +1,537 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+"""Apertus multimodal preprocessing helpers."""
+
+import importlib.util
+import os
+import sys
+from collections.abc import Mapping, Sequence
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import torch
+from PIL import Image
+
+from vllm.logger import init_logger
+from vllm.multimodal.media import MediaWithBytes
+from vllm.tokenizers import TokenizerLike
+
+logger = init_logger(__name__)
+
+_EMU35_VISION_TOKENIZER_MODULE_PREFIX = "_vllm_apertus_emu35_vision_tokenizer"
+_EMU35_VQ_REQUIRED_FILES = ("config.yaml", "model.ckpt")
+_APERTUS_EMU35_CODEBASE_ENV_VAR = "VLLM_APERTUS_EMU35_CODEBASE"
+
+
+def get_default_apertus_cache_dir() -> Path:
+    cache_env = os.getenv("VLLM_APERTUS_MODELS_CACHE") or os.getenv(
+        "LMMS_EVAL_MODELS_CACHE"
+    )
+    if cache_env:
+        return Path(cache_env).expanduser()
+    return Path.home() / ".cache" / "vllm" / "apertus"
+
+
+def has_required_files(path: Path, required_files: Sequence[str]) -> bool:
+    return all((path / fname).is_file() for fname in required_files)
+
+
+def ensure_local_emu35_weights(
+    path: str,
+    hf_repo_id: str,
+    *,
+    required_files: Sequence[str] = _EMU35_VQ_REQUIRED_FILES,
+    cache_base_dir: str | None = None,
+) -> str:
+    expanded_path = Path(path).expanduser()
+    if expanded_path.exists() and expanded_path.is_dir():
+        if not has_required_files(expanded_path, required_files):
+            raise ValueError(
+                f"Local checkpoint at {expanded_path} is missing required "
+                f"files: {list(required_files)}."
+            )
+        return str(expanded_path.resolve())
+
+    cache_dir = (
+        Path(cache_base_dir).expanduser()
+        if cache_base_dir
+        else get_default_apertus_cache_dir()
+    )
+    repo_cache_path = cache_dir / hf_repo_id
+    if repo_cache_path.is_dir() and has_required_files(
+        repo_cache_path, required_files
+    ):
+        return str(repo_cache_path.resolve())
+
+    from huggingface_hub import snapshot_download
+
+    logger.info("Downloading %s to %s", hf_repo_id, repo_cache_path)
+    repo_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    snapshot_download(
+        repo_id=hf_repo_id,
+        local_dir=str(repo_cache_path),
+        allow_patterns=list(required_files),
+    )
+
+    if not has_required_files(repo_cache_path, required_files):
+        raise RuntimeError(
+            f"Resolved checkpoint at {repo_cache_path} is missing required "
+            f"files: {list(required_files)}."
+        )
+
+    return str(repo_cache_path.resolve())
+
+
+def resolve_emu35_codebase(mm_processor_kwargs: Mapping[str, object]) -> Path:
+    configured = mm_processor_kwargs.get("apertus_emu35_codebase")
+    candidates: list[Path] = []
+
+    if isinstance(configured, str) and configured.strip():
+        candidates.append(Path(os.path.expandvars(configured.strip())).expanduser())
+
+    env_value = os.getenv(_APERTUS_EMU35_CODEBASE_ENV_VAR)
+    if env_value:
+        candidates.append(Path(os.path.expandvars(env_value)).expanduser())
+
+    repo_root = Path(__file__).resolve().parents[3]
+    integration_root = repo_root.parent
+    candidates.extend(
+        [
+            integration_root / "vllm-omni" / "external" / "Emu3.5",
+            integration_root / "lmms-eval" / "external" / "Emu3.5",
+        ]
+    )
+
+    for candidate in candidates:
+        module_path = candidate / "src" / "vision_tokenizer" / "__init__.py"
+        if module_path.is_file():
+            return candidate.resolve()
+
+    raise FileNotFoundError(
+        "Unable to locate Emu3.5 vision tokenizer code. Set "
+        f"{_APERTUS_EMU35_CODEBASE_ENV_VAR} or pass "
+        "`apertus_emu35_codebase` in mm_processor_kwargs. Expected a checkout "
+        "with `src/vision_tokenizer/__init__.py`, for example the "
+        "`vllm-omni/external/Emu3.5` submodule."
+    )
+
+
+@lru_cache(maxsize=4)
+def load_emu35_build_vision_tokenizer(emu35_codebase: str) -> Any:
+    module_path = (
+        Path(emu35_codebase).resolve() / "src" / "vision_tokenizer" / "__init__.py"
+    )
+    if not module_path.is_file():
+        raise FileNotFoundError(
+            f"Unable to locate Emu3.5 vision tokenizer module: {module_path}"
+        )
+
+    module_name = f"{_EMU35_VISION_TOKENIZER_MODULE_PREFIX}_{abs(hash(module_path))}"
+    module = sys.modules.get(module_name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            module_name,
+            module_path,
+            submodule_search_locations=[str(module_path.parent)],
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Failed to build import spec for {module_path}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+
+    build_vision_tokenizer = getattr(module, "build_vision_tokenizer", None)
+    if build_vision_tokenizer is None:
+        raise AttributeError(
+            "Emu3.5 vision tokenizer module does not expose "
+            "`build_vision_tokenizer`."
+        )
+    return build_vision_tokenizer
+
+
+def build_emu35_vision_tokenizer(
+    *,
+    emu35_codebase: Path,
+    vq_hub: str,
+    default_repo: str,
+    device: str,
+    vq_type: str = "ibq",
+    cache_base_dir: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    local_vq_path = ensure_local_emu35_weights(
+        vq_hub,
+        default_repo,
+        required_files=_EMU35_VQ_REQUIRED_FILES,
+        cache_base_dir=cache_base_dir,
+    )
+    build_vision_tokenizer = load_emu35_build_vision_tokenizer(str(emu35_codebase))
+    return build_vision_tokenizer(
+        type=vq_type,
+        model_path=local_vq_path,
+        device=device,
+        **kwargs,
+    ).eval()
+
+
+class ApertusImageTokenizer:
+    DEFAULT_VQ_HUB = "BAAI/Emu3.5-VisionTokenizer"
+    DEFAULT_MIN_PIXELS = 256 * 256
+    DEFAULT_MAX_PIXELS = 1400 * 1400
+    DEFAULT_IMAGE_PLACEHOLDER = "<|image|>"
+    VISUAL_TEMPLATE = "<|visual token {token_id}|>"
+    EMU35_DS_FACTOR = 16
+    DEFAULT_BOI_TOKEN = "<|img_start|>"
+    DEFAULT_IMG_TOKEN = "<|img_token_start|>"
+    DEFAULT_EOL_TOKEN = "<|img_end_of_row|>"
+    DEFAULT_EOI_TOKEN = "<|img_end|>"
+
+    def __init__(self) -> None:
+        self._vision_tokenizer_cache: dict[
+            tuple[str, str, str, torch.dtype, bool, str], Any
+        ] = {}
+
+    @staticmethod
+    def coerce_int(value: object, *, default: int) -> int:
+        if value is None:
+            return default
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def coerce_dtype(value: object) -> torch.dtype:
+        if isinstance(value, torch.dtype):
+            return value
+        if value is None:
+            return torch.bfloat16
+
+        mapping = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+        }
+        return mapping.get(str(value).lower().strip(), torch.bfloat16)
+
+    @staticmethod
+    def smart_resize(image: Image.Image, area: int, ds_factor: int) -> Image.Image:
+        width, height = image.size
+        aspect_ratio = width / height
+        new_height = int((area / aspect_ratio) ** 0.5)
+        new_width = int(new_height * aspect_ratio)
+        new_height = ((new_height + ds_factor // 2) // ds_factor) * ds_factor
+        new_width = ((new_width + ds_factor // 2) // ds_factor) * ds_factor
+        return image.resize((new_width, new_height), Image.BICUBIC)
+
+    @staticmethod
+    def coerce_pil_image(image: object) -> Image.Image:
+        if isinstance(image, MediaWithBytes):
+            image = image.media
+
+        if isinstance(image, Image.Image):
+            return image.convert("RGB")
+
+        if isinstance(image, torch.Tensor):
+            array = image.detach().to("cpu")
+            if array.ndim != 3:
+                raise TypeError("Apertus image adapter expects 3D image tensors.")
+            if array.shape[0] in (1, 3, 4):
+                array = array.permute(1, 2, 0)
+            array_np = array.numpy()
+        elif isinstance(image, np.ndarray):
+            array_np = image
+            if array_np.ndim != 3:
+                raise TypeError("Apertus image adapter expects 3D image arrays.")
+            if array_np.shape[0] in (1, 3, 4) and array_np.shape[-1] not in (1, 3, 4):
+                array_np = np.transpose(array_np, (1, 2, 0))
+        else:
+            raise TypeError(
+                "Apertus image adapter expects PIL images, numpy arrays, or "
+                "torch tensors in multi_modal_data['image']."
+            )
+
+        if np.issubdtype(array_np.dtype, np.floating):
+            max_value = float(np.nanmax(array_np)) if array_np.size else 1.0
+            if max_value <= 1.0:
+                array_np = array_np * 255.0
+            array_np = np.clip(array_np, 0, 255).astype(np.uint8)
+        elif array_np.dtype != np.uint8:
+            array_np = np.clip(array_np, 0, 255).astype(np.uint8)
+
+        return Image.fromarray(array_np).convert("RGB")
+
+    @staticmethod
+    def extract_emu35_token_grid(
+        encode_out: Any,
+        token_height: int,
+        token_width: int,
+    ) -> torch.Tensor:
+        def _unwrap_token_payload(payload: Any) -> Any:
+            token = payload
+            if isinstance(token, tuple):
+                token = token[2] if len(token) >= 3 else token[-1]
+
+            while isinstance(token, (list, tuple)):
+                if not token:
+                    raise ValueError(
+                        "Apertus Emu3.5 encoding produced an empty token sequence."
+                    )
+                non_none = [item for item in token if item is not None]
+                if not non_none:
+                    raise ValueError(
+                        "Apertus Emu3.5 encoding produced only None token entries."
+                    )
+                token = non_none[-1]
+
+            if isinstance(token, Mapping):
+                for key in ("token_ids", "indices", "codes", "tokens"):
+                    value = token.get(key)
+                    if value is not None:
+                        return _unwrap_token_payload(value)
+                non_none_values = [
+                    value for value in token.values() if value is not None
+                ]
+                if not non_none_values:
+                    raise ValueError(
+                        "Apertus Emu3.5 encoding produced an empty token mapping."
+                    )
+                token = non_none_values[-1]
+
+            return token
+
+        token = _unwrap_token_payload(encode_out)
+        if not isinstance(token, torch.Tensor):
+            token = torch.tensor(token)
+
+        while token.ndim > 2:
+            token = token[0] if token.shape[0] == 1 else token[-1]
+
+        if token.ndim == 1:
+            expected = token_height * token_width
+            if token.numel() != expected:
+                raise ValueError(
+                    "Apertus Emu3.5 token length mismatch: "
+                    f"got {token.numel()}, expected {expected}."
+                )
+            token = token.view(token_height, token_width)
+        elif token.ndim == 2:
+            if token.shape == (token_height, token_width):
+                pass
+            elif token.numel() == token_height * token_width:
+                token = token.reshape(token_height, token_width)
+            else:
+                raise ValueError(
+                    "Apertus Emu3.5 token grid shape mismatch: "
+                    f"got {tuple(token.shape)}, expected "
+                    f"{(token_height, token_width)}."
+                )
+        else:
+            raise ValueError(f"Unexpected Emu3.5 token rank: {token.ndim}.")
+
+        return token.to(dtype=torch.int64)
+
+    @staticmethod
+    def apertus_special_token(
+        tokenizer: TokenizerLike,
+        attr_name: str,
+        fallback: str,
+    ) -> str:
+        token = getattr(tokenizer, attr_name, None)
+        return token if isinstance(token, str) and token else fallback
+
+    @classmethod
+    def placeholder_aliases(
+        cls,
+        tokenizer: TokenizerLike,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> list[str]:
+        configured_placeholder = mm_processor_kwargs.get("apertus_image_placeholder")
+        tokenizer_placeholder = getattr(tokenizer, "image_token", None)
+        candidates = [
+            configured_placeholder if isinstance(configured_placeholder, str) else "",
+            tokenizer_placeholder if isinstance(tokenizer_placeholder, str) else "",
+            cls.DEFAULT_IMAGE_PLACEHOLDER,
+            "<image>",
+        ]
+
+        seen: set[str] = set()
+        aliases: list[str] = []
+        for candidate in candidates:
+            if candidate and candidate not in seen:
+                seen.add(candidate)
+                aliases.append(candidate)
+        return aliases
+
+    def load_vision_tokenizer(
+        self,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> Any:
+        vq_hub = str(
+            mm_processor_kwargs.get(
+                "apertus_vq_hub",
+                mm_processor_kwargs.get("vq_hub", self.DEFAULT_VQ_HUB),
+            )
+        )
+        vq_type = str(
+            mm_processor_kwargs.get(
+                "apertus_vq_type",
+                mm_processor_kwargs.get("vq_type", "ibq"),
+            )
+        )
+        vision_device = str(
+            mm_processor_kwargs.get("apertus_vision_tokenizer_device", "cuda:1")
+        )
+        vision_dtype = self.coerce_dtype(
+            mm_processor_kwargs.get("apertus_vision_tokenizer_dtype")
+        )
+        if vision_device == "cpu" and vision_dtype in (torch.float16, torch.bfloat16):
+            vision_dtype = torch.float32
+
+        trust_remote_code = bool(
+            mm_processor_kwargs.get("apertus_vq_trust_remote_code", True)
+        )
+        emu35_codebase = resolve_emu35_codebase(mm_processor_kwargs)
+        cache_key = (
+            vq_hub,
+            vq_type,
+            vision_device,
+            vision_dtype,
+            trust_remote_code,
+            str(emu35_codebase),
+        )
+
+        if cache_key in self._vision_tokenizer_cache:
+            return self._vision_tokenizer_cache[cache_key]
+
+        kwargs: dict[str, Any] = {
+            "dtype": vision_dtype,
+            "trust_remote_code": trust_remote_code,
+        }
+        cache_base_dir = mm_processor_kwargs.get("apertus_vq_cache_dir")
+        vision_tokenizer = build_emu35_vision_tokenizer(
+            emu35_codebase=emu35_codebase,
+            vq_hub=vq_hub,
+            default_repo=self.DEFAULT_VQ_HUB,
+            device=vision_device,
+            vq_type=vq_type,
+            cache_base_dir=cache_base_dir
+            if isinstance(cache_base_dir, str)
+            else None,
+            **kwargs,
+        )
+        if isinstance(vision_dtype, torch.dtype):
+            vision_tokenizer = vision_tokenizer.to(dtype=vision_dtype)
+
+        self._vision_tokenizer_cache[cache_key] = vision_tokenizer
+        return vision_tokenizer
+
+    def build_apertus_image_prompt(
+        self,
+        image_tokens: torch.Tensor,
+        tokenizer: TokenizerLike,
+    ) -> str:
+        if image_tokens.ndim != 2:
+            raise ValueError(
+                f"Apertus image tokens must be 2D, got "
+                f"shape {tuple(image_tokens.shape)}"
+            )
+
+        height, width = image_tokens.shape
+        rows = [
+            "".join(
+                self.VISUAL_TEMPLATE.format(token_id=int(token_id))
+                for token_id in row
+            )
+            for row in image_tokens.detach().to("cpu").tolist()
+        ]
+        eol_token = self.apertus_special_token(
+            tokenizer, "eol_token", self.DEFAULT_EOL_TOKEN
+        )
+        imgstr = eol_token.join(rows)
+
+        boi_token = self.apertus_special_token(
+            tokenizer, "boi_token", self.DEFAULT_BOI_TOKEN
+        )
+        img_token = self.apertus_special_token(
+            tokenizer, "img_token", self.DEFAULT_IMG_TOKEN
+        )
+        eoi_token = self.apertus_special_token(
+            tokenizer, "eoi_token", self.DEFAULT_EOI_TOKEN
+        )
+
+        return f"{boi_token}{height}*{width}{img_token}{imgstr}{eoi_token}"
+
+    def encode_images(
+        self,
+        images: Sequence[object],
+        *,
+        tokenizer: TokenizerLike,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> list[str]:
+        if not images:
+            return []
+
+        min_pixels = self.coerce_int(
+            mm_processor_kwargs.get(
+                "apertus_min_pixels",
+                mm_processor_kwargs.get("emu_min_pixels", self.DEFAULT_MIN_PIXELS),
+            ),
+            default=self.DEFAULT_MIN_PIXELS,
+        )
+        max_pixels = self.coerce_int(
+            mm_processor_kwargs.get(
+                "apertus_max_pixels",
+                mm_processor_kwargs.get("emu_max_pixels", self.DEFAULT_MAX_PIXELS),
+            ),
+            default=self.DEFAULT_MAX_PIXELS,
+        )
+
+        vision_tokenizer = self.load_vision_tokenizer(mm_processor_kwargs)
+        vision_params = next(vision_tokenizer.parameters())
+        vision_device = vision_params.device
+        vision_dtype = vision_params.dtype
+
+        image_prompts: list[str] = []
+        for raw_image in images:
+            image = self.coerce_pil_image(raw_image)
+            width, height = image.size
+            current_area = width * height
+            target_area = max(min(max_pixels, current_area), min_pixels)
+            resized_image = self.smart_resize(image, target_area, self.EMU35_DS_FACTOR)
+            resized_w, resized_h = resized_image.size
+
+            image_tensor = torch.tensor(
+                (np.array(resized_image) / 127.5 - 1.0),
+                device=vision_device,
+                dtype=vision_dtype,
+            ).permute(2, 0, 1)
+
+            with torch.inference_mode():
+                try:
+                    encode_out = vision_tokenizer.encode(image_tensor[None])
+                except TypeError:
+                    try:
+                        encode_out = vision_tokenizer.encode(
+                            pixel_values=image_tensor[None]
+                        )
+                    except TypeError:
+                        encode_out = vision_tokenizer.encode(images=image_tensor[None])
+
+            token_h = resized_h // self.EMU35_DS_FACTOR
+            token_w = resized_w // self.EMU35_DS_FACTOR
+            image_token_grid = self.extract_emu35_token_grid(
+                encode_out, token_h, token_w
+            )
+            image_prompts.append(
+                self.build_apertus_image_prompt(image_token_grid, tokenizer)
+            )
+
+        return image_prompts
