@@ -64,7 +64,11 @@ from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
     MultiModalKwargsItems,
 )
-from vllm.multimodal.parse import ImageProcessorItems, MultiModalDataItems
+from vllm.multimodal.parse import (
+    AudioProcessorItems,
+    ImageProcessorItems,
+    MultiModalDataItems,
+)
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
     BaseMultiModalProcessor,
@@ -77,7 +81,7 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
 
-from .apertus_utils import ApertusImageTokenizer
+from .apertus_utils import ApertusAudioTokenizer, ApertusImageTokenizer
 from .interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -103,13 +107,17 @@ class ApertusProcessingInfo(BaseProcessingInfo):
         return self.ctx.get_hf_config(ApertusConfig)
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None}
+        return {"image": None, "audio": None}
 
 
 class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         num_images = mm_counts.get("image", 0)
-        return ApertusImageTokenizer.DEFAULT_IMAGE_PLACEHOLDER * num_images
+        num_audios = mm_counts.get("audio", 0)
+        return (
+            ApertusImageTokenizer.DEFAULT_IMAGE_PLACEHOLDER * num_images
+            + ApertusAudioTokenizer.DEFAULT_AUDIO_PLACEHOLDER * num_audios
+        )
 
     def get_dummy_mm_data(
         self,
@@ -119,7 +127,9 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
     ) -> MultiModalDataDict:
         del seq_len
         num_images = mm_counts.get("image", 0)
+        num_audios = mm_counts.get("audio", 0)
         image_overrides = mm_options.get("image")
+        audio_overrides = mm_options.get("audio")
         max_side = int(ApertusImageTokenizer.DEFAULT_MAX_PIXELS**0.5)
         return {
             "image": self._get_dummy_images(
@@ -127,7 +137,12 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
                 height=max_side,
                 num_images=num_images,
                 overrides=image_overrides,
-            )
+            ),
+            "audio": self._get_dummy_audios(
+                length=16000,
+                num_audios=num_audios,
+                overrides=audio_overrides,
+            ),
         }
 
 
@@ -141,6 +156,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
     ) -> None:
         super().__init__(info, dummy_inputs, cache=cache)
         self.image_tokenizer = ApertusImageTokenizer()
+        self.audio_tokenizer = ApertusAudioTokenizer()
 
     def _get_mm_fields_config(
         self,
@@ -158,7 +174,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         return []
 
     @staticmethod
-    def _find_image_placeholders(prompt: str, aliases: Sequence[str]) -> list[str]:
+    def _find_placeholders(prompt: str, aliases: Sequence[str]) -> list[str]:
         placeholders: list[tuple[int, str]] = []
         for alias in aliases:
             start = 0
@@ -172,12 +188,18 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         placeholders.sort(key=lambda item: item[0])
         return [placeholder for _, placeholder in placeholders]
 
-    def _validate_only_image_inputs(self, mm_items: MultiModalDataItems) -> None:
-        unsupported = [modality for modality in mm_items if modality != "image"]
+    def _validate_supported_inputs(self, mm_items: MultiModalDataItems) -> None:
+        supported_modalities = {"image", "audio"}
+        unsupported = [
+            modality
+            for modality in mm_items
+            if modality not in supported_modalities
+        ]
         if unsupported:
             raise ValueError(
                 "Apertus multimodal preprocessing currently supports only "
-                f"image inputs. Unsupported modalities: {unsupported}"
+                f"{sorted(supported_modalities)} inputs. "
+                f"Unsupported modalities: {unsupported}"
             )
 
     def _tokenize_text(
@@ -194,7 +216,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         inputs: ProcessorInputs,
         timing_ctx: TimingContext,
     ) -> MultiModalInput:
-        self._validate_only_image_inputs(inputs.mm_data_items)
+        self._validate_supported_inputs(inputs.mm_data_items)
 
         tokenizer = self.info.get_tokenizer()
         prompt_text = (
@@ -203,7 +225,31 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             else tokenizer.decode(inputs.prompt)
         )
 
-        if inputs.mm_data_items.get_count("image", strict=False) == 0:
+        num_images = inputs.mm_data_items.get_count("image", strict=False)
+        num_audios = inputs.mm_data_items.get_count("audio", strict=False)
+        image_aliases = self.image_tokenizer.placeholder_aliases(
+            tokenizer, inputs.hf_processor_mm_kwargs
+        )
+        image_placeholders = self._find_placeholders(prompt_text, image_aliases)
+        audio_aliases = self.audio_tokenizer.placeholder_aliases(
+            inputs.hf_processor_mm_kwargs
+        )
+        audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
+
+        if num_images == 0 and num_audios == 0:
+            if image_placeholders:
+                raise ValueError(
+                    "Apertus image placeholder/input mismatch: found "
+                    f"{len(image_placeholders)} placeholder(s) in the prompt "
+                    f"using aliases {image_aliases}, but received 0 image input(s)."
+                )
+            if audio_placeholders:
+                raise ValueError(
+                    "Apertus audio placeholder/input mismatch: found "
+                    f"{len(audio_placeholders)} placeholder(s) in the prompt "
+                    f"using aliases {audio_aliases}, but received 0 audio input(s)."
+                )
+
             with timing_ctx.record("tokenize"):
                 prompt_token_ids = self._tokenize_text(
                     prompt_text,
@@ -217,36 +263,78 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 prompt=prompt_text,
             )
 
-        with timing_ctx.record("encode_apertus_images"):
-            image_items = inputs.mm_data_items.get_items("image", ImageProcessorItems)
-            images = [image_items[idx] for idx in range(len(image_items))]
-            image_prompts = self.image_tokenizer.encode_images(
-                images,
-                tokenizer=tokenizer,
-                mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
-            )
+        mm_counts: dict[str, int] = {}
+        prompt_replacements: list[PromptReplacement] = []
 
-        aliases = self.image_tokenizer.placeholder_aliases(
-            tokenizer, inputs.hf_processor_mm_kwargs
-        )
-        placeholders = self._find_image_placeholders(prompt_text, aliases)
-        if len(placeholders) != len(image_prompts):
-            raise ValueError(
-                "Apertus image placeholder/input mismatch: found "
-                f"{len(placeholders)} placeholder(s) in the prompt using aliases "
-                f"{aliases}, but received {len(image_prompts)} image input(s)."
-            )
+        if num_images > 0:
+            with timing_ctx.record("encode_apertus_images"):
+                image_items = inputs.mm_data_items.get_items(
+                    "image", ImageProcessorItems
+                )
+                images = [image_items[idx] for idx in range(len(image_items))]
+                image_prompts = self.image_tokenizer.encode_images(
+                    images,
+                    tokenizer=tokenizer,
+                    mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
+                )
 
-        prompt_updates = self._bind_and_group_updates(
-            [
+            if len(image_placeholders) != len(image_prompts):
+                raise ValueError(
+                    "Apertus image placeholder/input mismatch: found "
+                    f"{len(image_placeholders)} placeholder(s) in the prompt "
+                    f"using aliases {image_aliases}, but received "
+                    f"{len(image_prompts)} image input(s)."
+                )
+            mm_counts["image"] = len(image_prompts)
+            prompt_replacements.append(
                 PromptReplacement(
                     modality="image",
-                    target=lambda item_idx: placeholders[item_idx],
+                    target=lambda item_idx: image_placeholders[item_idx],
                     replacement=lambda item_idx: image_prompts[item_idx],
                 )
-            ],
-            {"image": len(image_prompts)},
-        )
+            )
+        elif image_placeholders:
+            raise ValueError(
+                "Apertus image placeholder/input mismatch: found "
+                f"{len(image_placeholders)} placeholder(s) in the prompt using "
+                f"aliases {image_aliases}, but received 0 image input(s)."
+            )
+
+        if num_audios > 0:
+            with timing_ctx.record("encode_apertus_audios"):
+                audio_items = inputs.mm_data_items.get_items(
+                    "audio", AudioProcessorItems
+                )
+                audios = [audio_items[idx] for idx in range(len(audio_items))]
+                audio_prompts = self.audio_tokenizer.encode_audios(
+                    audios,
+                    tokenizer=tokenizer,
+                    mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
+                )
+
+            if len(audio_placeholders) != len(audio_prompts):
+                raise ValueError(
+                    "Apertus audio placeholder/input mismatch: found "
+                    f"{len(audio_placeholders)} placeholder(s) in the prompt "
+                    f"using aliases {audio_aliases}, but received "
+                    f"{len(audio_prompts)} audio input(s)."
+                )
+            mm_counts["audio"] = len(audio_prompts)
+            prompt_replacements.append(
+                PromptReplacement(
+                    modality="audio",
+                    target=lambda item_idx: audio_placeholders[item_idx],
+                    replacement=lambda item_idx: audio_prompts[item_idx],
+                )
+            )
+        elif audio_placeholders:
+            raise ValueError(
+                "Apertus audio placeholder/input mismatch: found "
+                f"{len(audio_placeholders)} placeholder(s) in the prompt using "
+                f"aliases {audio_aliases}, but received 0 audio input(s)."
+            )
+
+        prompt_updates = self._bind_and_group_updates(prompt_replacements, mm_counts)
 
         with timing_ctx.record("apply_prompt_updates"):
             merged_prompt, match_result = self._apply_text_matches(
@@ -258,7 +346,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             for update_idxs in match_result.values()
             for update_idx in update_idxs
         ):
-            raise RuntimeError("Failed to replace all Apertus image placeholders.")
+            raise RuntimeError("Failed to replace all Apertus multimodal placeholders.")
 
         with timing_ctx.record("tokenize"):
             prompt_token_ids = self._tokenize_text(
@@ -748,13 +836,15 @@ class ApertusForCausalLM(
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality == "image":
             return ApertusImageTokenizer.DEFAULT_IMAGE_PLACEHOLDER
+        if modality == "audio":
+            return ApertusAudioTokenizer.DEFAULT_AUDIO_PLACEHOLDER
 
         raise ValueError(f"Unsupported modality: {modality}")
 
     def embed_multimodal(self, **kwargs: object) -> MultiModalEmbeddings:
         if kwargs:
             raise ValueError(
-                "Apertus image inputs are serialized to token IDs during "
+                "Apertus multimodal inputs are serialized to token IDs during "
                 "preprocessing and should not reach the model as multimodal "
                 f"kwargs. Got keys: {sorted(kwargs)}"
             )
@@ -770,7 +860,8 @@ class ApertusForCausalLM(
         if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
             raise ValueError(
                 "Apertus does not merge multimodal embeddings in the model. "
-                "Images must be serialized to token IDs by the processor."
+                "Multimodal inputs must be serialized to token IDs by the "
+                "processor."
             )
         return self.model.embed_input_ids(input_ids)
 
