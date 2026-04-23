@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
@@ -10,7 +11,9 @@ from vllm.model_executor.models.apertus import (
     ApertusMultiModalProcessor,
 )
 from vllm.model_executor.models.apertus_utils import (
+    ApertusAudioTokenizer,
     ApertusImageTokenizer,
+    resolve_apertus_audio_tokenizer_codebase,
     resolve_emu35_codebase,
 )
 from vllm.multimodal.media import MediaWithBytes
@@ -22,17 +25,85 @@ pytestmark = pytest.mark.cpu_test
 
 class DummyTokenizer:
     image_token = "<|image|>"
+    audio_token = "<|audio|>"
+    unk_token_id = -1
 
     def __init__(self) -> None:
         self.encoded_texts: list[str] = []
+        self._token_to_id: dict[str, int] = {
+            "<|image|>": 900001,
+            "<image>": 900002,
+            "<|audio|>": 900003,
+            "<|audio_start|>": 900004,
+            "<|audio_end|>": 900005,
+            "<|stt_transcribe|>": 900006,
+            "<|stt_continue|>": 900007,
+            "<|tts_continue|>": 900008,
+        }
+        self._id_to_token = {
+            token_id: token for token, token_id in self._token_to_id.items()
+        }
+        self._update_special_order()
+
+    def _update_special_order(self) -> None:
+        self._special_tokens = sorted(
+            self._token_to_id.keys(),
+            key=len,
+            reverse=True,
+        )
+
+    def register_token(self, token: str, token_id: int) -> None:
+        self._token_to_id[token] = token_id
+        self._id_to_token[token_id] = token
+        self._update_special_order()
+
+    def convert_tokens_to_ids(self, tokens):
+        if isinstance(tokens, list):
+            return [self.convert_tokens_to_ids(token) for token in tokens]
+        return self._token_to_id.get(tokens, self.unk_token_id)
+
+    def convert_ids_to_tokens(self, token_ids):
+        if isinstance(token_ids, list):
+            return [self.convert_ids_to_tokens(token_id) for token_id in token_ids]
+        return self._id_to_token.get(token_ids, f"<|tok:{token_ids}|>")
 
     def encode(self, text: str, **kwargs) -> list[int]:
         del kwargs
         self.encoded_texts.append(text)
-        return [ord(char) % 257 for char in text]
+
+        encoded: list[int] = []
+        idx = 0
+        while idx < len(text):
+            matched = False
+            for token in self._special_tokens:
+                if text.startswith(token, idx):
+                    encoded.append(self._token_to_id[token])
+                    idx += len(token)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            encoded.append(1000 + ord(text[idx]))
+            idx += 1
+
+        return encoded
 
     def decode(self, token_ids: list[int]) -> str:
-        return "".join(chr(token_id) for token_id in token_ids)
+        decoded: list[str] = []
+        for token_id in token_ids:
+            token = self._id_to_token.get(token_id)
+            if token is not None:
+                decoded.append(token)
+                continue
+
+            if token_id >= 1000:
+                decoded.append(chr(token_id - 1000))
+            else:
+                decoded.append("?")
+
+        return "".join(decoded)
 
 
 class DummyInfo:
@@ -55,12 +126,49 @@ def build_processor(tokenizer: DummyTokenizer) -> ApertusMultiModalProcessor:
     )
 
 
-def parse_mm_images(num_images: int):
-    images = [
-        Image.new("RGB", (16, 16), color=(idx, 0, 0))
-        for idx in range(num_images)
+def parse_mm_inputs(*, num_images: int = 0, num_audios: int = 0):
+    parser = MultiModalDataParser()
+    payload: dict[str, object] = {}
+
+    if num_images > 0:
+        payload["image"] = [
+            Image.new("RGB", (16, 16), color=(idx, 0, 0))
+            for idx in range(num_images)
+        ]
+    if num_audios > 0:
+        payload["audio"] = [
+            np.zeros((64,), dtype=np.float32) + idx
+            for idx in range(num_audios)
+        ]
+
+    return parser.parse_mm_data(payload)
+
+
+def install_fake_encoders(processor: ApertusMultiModalProcessor) -> None:
+    processor.image_tokenizer.encode_images = lambda images, **kwargs: [  # type: ignore[method-assign]
+        f"<IMG{idx}>"
+        for idx in range(len(images))
     ]
-    return MultiModalDataParser().parse_mm_data({"image": images})
+    processor.audio_tokenizer.encode_audios = lambda audios, **kwargs: [  # type: ignore[method-assign]
+        f"<AUD{idx}>"
+        for idx in range(len(audios))
+    ]
+
+
+def run_processor(
+    processor: ApertusMultiModalProcessor,
+    *,
+    prompt: str,
+    num_images: int = 0,
+    num_audios: int = 0,
+):
+    return processor.apply(
+        ProcessorInputs(
+            prompt=prompt,
+            mm_data_items=parse_mm_inputs(num_images=num_images, num_audios=num_audios),
+        ),
+        TimingContext(enabled=False),
+    )
 
 
 def test_apertus_image_prompt_serialization_uses_expected_tokens():
@@ -104,84 +212,293 @@ def test_apertus_image_tokenizer_unwraps_media_with_bytes():
     assert coerced.size == image.size
 
 
-def test_apertus_processor_replaces_placeholders_then_tokenizes():
+def test_apertus_processor_text_only():
     tokenizer = DummyTokenizer()
     processor = build_processor(tokenizer)
-    processor.image_tokenizer.encode_images = lambda *args, **kwargs: [
-        "<IMG0>",
-        "<IMG1>",
-    ]
+    install_fake_encoders(processor)
 
-    result = processor.apply(
-        ProcessorInputs(
-            prompt="A <|image|> B <|image|> C",
-            mm_data_items=parse_mm_images(2),
-        ),
-        TimingContext(enabled=False),
-    )
-
-    assert result["prompt"] == "A <IMG0> B <IMG1> C"
-    assert tokenizer.encoded_texts == ["A <IMG0> B <IMG1> C"]
-    assert result["prompt_token_ids"] == tokenizer.encode(result["prompt"])
-    assert not result["mm_kwargs"]
-    assert result["mm_hashes"] == {}
-    assert result["mm_placeholders"] == {}
-
-
-def test_apertus_processor_accepts_legacy_image_placeholder_alias():
-    tokenizer = DummyTokenizer()
-    processor = build_processor(tokenizer)
-    processor.image_tokenizer.encode_images = lambda *args, **kwargs: ["<IMG0>"]
-
-    result = processor.apply(
-        ProcessorInputs(
-            prompt="A <image> C",
-            mm_data_items=parse_mm_images(1),
-        ),
-        TimingContext(enabled=False),
-    )
-
-    assert result["prompt"] == "A <IMG0> C"
-
-
-def test_apertus_processor_rejects_placeholder_image_mismatch():
-    tokenizer = DummyTokenizer()
-    processor = build_processor(tokenizer)
-    processor.image_tokenizer.encode_images = lambda *args, **kwargs: ["<IMG0>"]
-
-    with pytest.raises(ValueError, match="placeholder/input mismatch"):
-        processor.apply(
-            ProcessorInputs(
-                prompt="A C",
-                mm_data_items=parse_mm_images(1),
-            ),
-            TimingContext(enabled=False),
-        )
-
-
-def test_apertus_processor_text_only_path():
-    tokenizer = DummyTokenizer()
-    processor = build_processor(tokenizer)
-    result = processor.apply(
-        ProcessorInputs(
-            prompt="plain text",
-            mm_data_items=MultiModalDataParser().parse_mm_data({}),
-        ),
-        TimingContext(enabled=False),
-    )
+    result = run_processor(processor, prompt="plain text")
 
     assert result["prompt"] == "plain text"
     assert tokenizer.encoded_texts == ["plain text"]
     assert result["mm_placeholders"] == {}
+    assert result["mm_kwargs"] == {}
+
+
+def test_apertus_processor_image_only():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="<|image|>",
+        num_images=1,
+    )
+
+    assert result["prompt"] == "<IMG0>"
+
+
+def test_apertus_processor_audio_only():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="<|audio|>",
+        num_audios=1,
+    )
+
+    assert result["prompt"] == "<AUD0>"
+
+
+def test_apertus_processor_image_text():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A <|image|> B",
+        num_images=1,
+    )
+
+    assert result["prompt"] == "A <IMG0> B"
+
+
+def test_apertus_processor_audio_text():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A <|audio|> B",
+        num_audios=1,
+    )
+
+    assert result["prompt"] == "A <AUD0> B"
+
+
+def test_apertus_processor_image_audio():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="<|image|><|audio|>",
+        num_images=1,
+        num_audios=1,
+    )
+
+    assert result["prompt"] == "<IMG0><AUD0>"
+
+
+def test_apertus_processor_image_audio_text():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="T<|image|>M<|audio|>E",
+        num_images=1,
+        num_audios=1,
+    )
+
+    assert result["prompt"] == "T<IMG0>M<AUD0>E"
+
+
+def test_apertus_processor_multiple_audio_placeholders():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A<|audio|>B<|audio|>C",
+        num_audios=2,
+    )
+
+    assert result["prompt"] == "A<AUD0>B<AUD1>C"
+
+
+def test_apertus_processor_multiple_image_placeholders():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A<|image|>B<|image|>C",
+        num_images=2,
+    )
+
+    assert result["prompt"] == "A<IMG0>B<IMG1>C"
+
+
+def test_apertus_processor_mixed_multiple_ordered_replacement():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A<|image|>B<|audio|>C<|image|>D<|audio|>E",
+        num_images=2,
+        num_audios=2,
+    )
+
+    assert result["prompt"] == "A<IMG0>B<AUD0>C<IMG1>D<AUD1>E"
+
+
+def test_apertus_processor_absent_modality_without_placeholder():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A <|image|> B",
+        num_images=1,
+        num_audios=0,
+    )
+
+    assert result["prompt"] == "A <IMG0> B"
+
+
+def test_apertus_processor_placeholder_present_but_missing_input():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    with pytest.raises(ValueError, match="audio placeholder/input mismatch"):
+        run_processor(
+            processor,
+            prompt="A <|audio|> B",
+            num_audios=0,
+        )
+
+
+def test_apertus_processor_image_placeholder_present_but_missing_input():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    with pytest.raises(ValueError, match="image placeholder/input mismatch"):
+        run_processor(
+            processor,
+            prompt="A <|image|> B",
+            num_images=0,
+        )
+
+
+def test_apertus_processor_input_present_but_missing_placeholder():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    with pytest.raises(ValueError, match="audio placeholder/input mismatch"):
+        run_processor(
+            processor,
+            prompt="A B",
+            num_audios=1,
+        )
+
+
+def test_apertus_processor_image_input_present_but_missing_placeholder():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    with pytest.raises(ValueError, match="image placeholder/input mismatch"):
+        run_processor(
+            processor,
+            prompt="A B",
+            num_images=1,
+        )
+
+
+def test_apertus_audio_token_serialization_roundtrip():
+    tokenizer = DummyTokenizer()
+    tokenizer.register_token("<|audio_code_1|>", 262345)
+    tokenizer.register_token("<|audio_code_2|>", 262346)
+
+    token_ids = [
+        tokenizer.convert_tokens_to_ids("<|audio_start|>"),
+        tokenizer.convert_tokens_to_ids("<|audio_code_1|>"),
+        tokenizer.convert_tokens_to_ids("<|audio_code_2|>"),
+        tokenizer.convert_tokens_to_ids("<|audio_end|>"),
+    ]
+    serialized = ApertusAudioTokenizer().serialize_audio_token_ids(
+        token_ids,
+        tokenizer,
+        validate_roundtrip=True,
+    )
+
+    assert tokenizer.encode(serialized, add_special_tokens=False) == token_ids
 
 
 def test_apertus_model_placeholder_str():
     assert ApertusForCausalLM.get_placeholder_str("image", 0) == "<|image|>"
+    assert ApertusForCausalLM.get_placeholder_str("audio", 0) == "<|audio|>"
 
 
-def test_apertus_emu35_codebase_resolver_accepts_explicit_path(tmp_path):
+def test_apertus_emu35_codebase_resolver_requires_env_var(tmp_path):
     module_dir = tmp_path / "src" / "vision_tokenizer"
     module_dir.mkdir(parents=True)
     (module_dir / "__init__.py").write_text("", encoding="utf-8")
 
-    assert resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)}) == tmp_path
+    with pytest.raises(FileNotFoundError,
+                       match="VLLM_APERTUS_EMU35_CODEBASE"):
+        resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)})
+
+
+def test_apertus_emu35_codebase_resolver_uses_env_var_only(tmp_path, monkeypatch):
+    module_dir = tmp_path / "src" / "vision_tokenizer"
+    module_dir.mkdir(parents=True)
+    (module_dir / "__init__.py").write_text("", encoding="utf-8")
+    monkeypatch.setenv("VLLM_APERTUS_EMU35_CODEBASE", str(tmp_path))
+
+    assert resolve_emu35_codebase({}) == tmp_path
+
+
+def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
+    paths = [
+        tmp_path
+        / "src"
+        / "audio_tokenizers"
+        / "implementations"
+        / "wavtokenizer.py",
+        tmp_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
+        tmp_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(tmp_path))
+
+    assert resolve_apertus_audio_tokenizer_codebase({}) == tmp_path
+
+
+def test_apertus_audio_codebase_resolver_uses_env_var_only(tmp_path):
+    paths = [
+        tmp_path
+        / "src"
+        / "audio_tokenizers"
+        / "implementations"
+        / "wavtokenizer.py",
+        tmp_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
+        tmp_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+    ]
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError,
+                       match="VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"):
+        resolve_apertus_audio_tokenizer_codebase(
+            {"apertus_audio_tokenizer_codebase": str(tmp_path)}
+        )
