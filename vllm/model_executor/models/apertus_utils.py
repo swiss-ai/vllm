@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import os
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from functools import lru_cache
 from pathlib import Path
@@ -19,6 +20,17 @@ from PIL import Image
 from vllm.logger import init_logger
 from vllm.multimodal.media import MediaWithBytes
 from vllm.tokenizers import TokenizerLike
+
+from .apertus_image_token_cache import (
+    ApertusImageTokenCacheConfig,
+    ApertusImageTokenizationCache,
+)
+from .apertus_image_token_cache.hashing import (
+    hash_image_payload,
+    hash_pil_image,
+    stable_cache_key,
+)
+from .apertus_image_token_cache.records import CollisionGuardVerificationData
 
 logger = init_logger(__name__)
 
@@ -171,6 +183,7 @@ def build_emu35_vision_tokenizer(
 
 
 class ApertusImageTokenizer:
+    IMAGE_TOKEN_CACHE_VERSION = "apertus-image-tokenization-v1"
     DEFAULT_VQ_HUB = "BAAI/Emu3.5-VisionTokenizer"
     DEFAULT_MIN_PIXELS = 256 * 256
     DEFAULT_MAX_PIXELS = 1400 * 1400
@@ -186,6 +199,12 @@ class ApertusImageTokenizer:
         self._vision_tokenizer_cache: dict[
             tuple[str, str, str, torch.dtype, bool, str], Any
         ] = {}
+        self._image_prompt_cache: ApertusImageTokenizationCache | None = None
+        self._image_prompt_cache_lock = threading.Lock()
+
+    def __del__(self) -> None:
+        if self._image_prompt_cache is not None:
+            self._image_prompt_cache.close()
 
     @staticmethod
     def coerce_int(value: object, *, default: int) -> int:
@@ -363,10 +382,10 @@ class ApertusImageTokenizer:
                 aliases.append(candidate)
         return aliases
 
-    def load_vision_tokenizer(
+    def _resolve_vision_tokenizer_settings(
         self,
         mm_processor_kwargs: Mapping[str, object],
-    ) -> Any:
+    ) -> tuple[str, str, str, torch.dtype, bool]:
         vq_hub = str(
             mm_processor_kwargs.get(
                 "apertus_vq_hub",
@@ -391,6 +410,35 @@ class ApertusImageTokenizer:
         trust_remote_code = bool(
             mm_processor_kwargs.get("apertus_vq_trust_remote_code", True)
         )
+        return vq_hub, vq_type, vision_device, vision_dtype, trust_remote_code
+
+    def _get_or_init_image_prompt_cache(self) -> ApertusImageTokenizationCache | None:
+        if self._image_prompt_cache is not None:
+            if self._image_prompt_cache.enabled:
+                return self._image_prompt_cache
+            return None
+
+        with self._image_prompt_cache_lock:
+            if self._image_prompt_cache is None:
+                self._image_prompt_cache = ApertusImageTokenizationCache(
+                    ApertusImageTokenCacheConfig.from_env()
+                )
+
+        if self._image_prompt_cache is None:
+            return None
+        return self._image_prompt_cache if self._image_prompt_cache.enabled else None
+
+    def load_vision_tokenizer(
+        self,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> Any:
+        (
+            vq_hub,
+            vq_type,
+            vision_device,
+            vision_dtype,
+            trust_remote_code,
+        ) = self._resolve_vision_tokenizer_settings(mm_processor_kwargs)
         emu35_codebase = resolve_emu35_codebase(mm_processor_kwargs)
         cache_key = (
             vq_hub,
@@ -487,19 +535,113 @@ class ApertusImageTokenizer:
             default=self.DEFAULT_MAX_PIXELS,
         )
 
-        vision_tokenizer = self.load_vision_tokenizer(mm_processor_kwargs)
-        vision_params = next(vision_tokenizer.parameters())
-        vision_device = vision_params.device
-        vision_dtype = vision_params.dtype
+        (
+            vq_hub,
+            vq_type,
+            vision_device_name,
+            vision_dtype_name,
+            _trust_remote_code,
+        ) = self._resolve_vision_tokenizer_settings(mm_processor_kwargs)
+
+        boi_token = self.apertus_special_token(
+            tokenizer, "boi_token", self.DEFAULT_BOI_TOKEN
+        )
+        img_token = self.apertus_special_token(
+            tokenizer, "img_token", self.DEFAULT_IMG_TOKEN
+        )
+        eol_token = self.apertus_special_token(
+            tokenizer, "eol_token", self.DEFAULT_EOL_TOKEN
+        )
+        eoi_token = self.apertus_special_token(
+            tokenizer, "eoi_token", self.DEFAULT_EOI_TOKEN
+        )
+
+        image_prompt_cache = self._get_or_init_image_prompt_cache()
+        collision_guard_enabled = (
+            bool(image_prompt_cache.collision_guard_enabled)
+            if image_prompt_cache is not None
+            else False
+        )
+
+        vision_tokenizer = None
+        vision_device = None
+        vision_dtype = None
 
         image_prompts: list[str] = []
         for raw_image in images:
             image = self.coerce_pil_image(raw_image)
+            guard_data: CollisionGuardVerificationData | None = None
+            raw_image_bytes: bytes | None = None
+            raw_image_sha256: str | None = None
+            if collision_guard_enabled:
+                raw_image_bytes = image.tobytes()
+                raw_image_sha256 = hash_image_payload(
+                    image.mode,
+                    image.size,
+                    raw_image_bytes,
+                )
+
             width, height = image.size
             current_area = width * height
             target_area = max(min(max_pixels, current_area), min_pixels)
             resized_image = self.smart_resize(image, target_area, self.EMU35_DS_FACTOR)
             resized_w, resized_h = resized_image.size
+            resized_image_hash = hash_pil_image(resized_image)
+
+            cache_key: str | None = None
+            fingerprint_payload: str | None = None
+            if image_prompt_cache is not None:
+                # We hash the resized RGB image because it is the exact
+                # effective input to Emu3.5 tokenization.
+                logical_key = (
+                    self.IMAGE_TOKEN_CACHE_VERSION,
+                    resized_image_hash,
+                    resized_image.size,
+                    min_pixels,
+                    max_pixels,
+                    self.EMU35_DS_FACTOR,
+                    vq_hub,
+                    vq_type,
+                    vision_device_name,
+                    str(vision_dtype_name),
+                    boi_token,
+                    img_token,
+                    eol_token,
+                    eoi_token,
+                    self.VISUAL_TEMPLATE,
+                )
+
+                # SHA-256 collision risk is treated as negligible in normal mode.
+                cache_key, fingerprint_payload = stable_cache_key(logical_key)
+                if (
+                    collision_guard_enabled
+                    and raw_image_bytes is not None
+                    and raw_image_sha256 is not None
+                    and fingerprint_payload is not None
+                ):
+                    guard_data = CollisionGuardVerificationData(
+                        fingerprint_payload=fingerprint_payload,
+                        raw_image_mode=image.mode,
+                        raw_image_size=image.size,
+                        raw_image_bytes=raw_image_bytes,
+                        raw_image_sha256=raw_image_sha256,
+                        resized_image_mode=resized_image.mode,
+                        resized_image_size=resized_image.size,
+                        resized_image_sha256=resized_image_hash,
+                    )
+                cached_prompt = image_prompt_cache.get(
+                    cache_key,
+                    guard_data=guard_data if collision_guard_enabled else None,
+                )
+                if cached_prompt is not None:
+                    image_prompts.append(cached_prompt)
+                    continue
+
+            if vision_tokenizer is None:
+                vision_tokenizer = self.load_vision_tokenizer(mm_processor_kwargs)
+                vision_params = next(vision_tokenizer.parameters())
+                vision_device = vision_params.device
+                vision_dtype = vision_params.dtype
 
             image_tensor = torch.tensor(
                 (np.array(resized_image) / 127.5 - 1.0),
@@ -523,8 +665,15 @@ class ApertusImageTokenizer:
             image_token_grid = self.extract_emu35_token_grid(
                 encode_out, token_h, token_w
             )
+            image_prompt = self.build_apertus_image_prompt(image_token_grid, tokenizer)
+            if image_prompt_cache is not None and cache_key is not None:
+                image_prompt_cache.put(
+                    cache_key,
+                    image_prompt,
+                    guard_data=guard_data if collision_guard_enabled else None,
+                )
             image_prompts.append(
-                self.build_apertus_image_prompt(image_token_grid, tokenizer)
+                image_prompt
             )
 
         return image_prompts
