@@ -80,6 +80,7 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.logger import init_logger
 
 from .apertus_utils import ApertusAudioTokenizer, ApertusImageTokenizer
 from .interfaces import (
@@ -100,6 +101,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class ApertusProcessingInfo(BaseProcessingInfo):
@@ -224,17 +227,45 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             if isinstance(inputs.prompt, str)
             else tokenizer.decode(inputs.prompt)
         )
+        merged_mm_processor_kwargs = self.info.ctx.get_merged_mm_kwargs(
+            inputs.hf_processor_mm_kwargs
+        )
 
         num_images = inputs.mm_data_items.get_count("image", strict=False)
         num_audios = inputs.mm_data_items.get_count("audio", strict=False)
         image_aliases = self.image_tokenizer.placeholder_aliases(
-            tokenizer, inputs.hf_processor_mm_kwargs
+            tokenizer,
+            merged_mm_processor_kwargs,
         )
         image_placeholders = self._find_placeholders(prompt_text, image_aliases)
         audio_aliases = self.audio_tokenizer.placeholder_aliases(
-            inputs.hf_processor_mm_kwargs
+            merged_mm_processor_kwargs
         )
         audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
+
+        if image_placeholders and num_images == 0:
+            # Apertus behavior: remove surplus image placeholders when no image is
+            # provided for that position.
+            image_placeholder_removals = self._bind_and_group_updates(
+                [
+                    PromptReplacement(
+                        modality="image",
+                        target=lambda item_idx: image_placeholders[item_idx],
+                        replacement=lambda item_idx: "",
+                    )
+                ],
+                {"image": len(image_placeholders)},
+            )
+            logger.info(
+                "[Apertus MM] removing %d unresolved image placeholder(s) "
+                "because received 0 image input(s)",
+                len(image_placeholders),
+            )
+            prompt_text, _ = self._apply_text_matches(
+                prompt_text,
+                image_placeholder_removals,
+            )
+            image_placeholders = []
 
         if num_images == 0 and num_audios == 0:
             if image_placeholders:
@@ -275,29 +306,34 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 image_prompts = self.image_tokenizer.encode_images(
                     images,
                     tokenizer=tokenizer,
-                    mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
+                    mm_processor_kwargs=merged_mm_processor_kwargs,
                 )
 
-            if len(image_placeholders) != len(image_prompts):
+            if len(image_placeholders) < len(image_prompts):
                 raise ValueError(
                     "Apertus image placeholder/input mismatch: found "
                     f"{len(image_placeholders)} placeholder(s) in the prompt "
                     f"using aliases {image_aliases}, but received "
-                    f"{len(image_prompts)} image input(s)."
+                    f"{len(image_prompts)} image input(s). "
+                    "Received more images than placeholders; refusing to "
+                    "silently drop or reorder images."
                 )
-            mm_counts["image"] = len(image_prompts)
+            if len(image_placeholders) > len(image_prompts):
+                logger.info(
+                    "[Apertus MM] prompt has %d image placeholder(s) but only %d "
+                    "image input(s); extra placeholder(s) will be replaced by \"\"",
+                    len(image_placeholders),
+                    len(image_prompts),
+                )
+            mm_counts["image"] = len(image_placeholders)
             prompt_replacements.append(
                 PromptReplacement(
                     modality="image",
                     target=lambda item_idx: image_placeholders[item_idx],
-                    replacement=lambda item_idx: image_prompts[item_idx],
+                    replacement=lambda item_idx: (
+                        image_prompts[item_idx] if item_idx < len(image_prompts) else ""
+                    ),
                 )
-            )
-        elif image_placeholders:
-            raise ValueError(
-                "Apertus image placeholder/input mismatch: found "
-                f"{len(image_placeholders)} placeholder(s) in the prompt using "
-                f"aliases {image_aliases}, but received 0 image input(s)."
             )
 
         if num_audios > 0:
@@ -309,7 +345,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 audio_prompts = self.audio_tokenizer.encode_audios(
                     audios,
                     tokenizer=tokenizer,
-                    mm_processor_kwargs=inputs.hf_processor_mm_kwargs,
+                    mm_processor_kwargs=merged_mm_processor_kwargs,
                 )
 
             if len(audio_placeholders) != len(audio_prompts):

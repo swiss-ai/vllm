@@ -111,6 +111,15 @@ class DummyInfo:
 
     def __init__(self, tokenizer: DummyTokenizer) -> None:
         self.tokenizer = tokenizer
+        self.ctx = type(
+            "DummyCtx",
+            (),
+            {
+                "get_merged_mm_kwargs": staticmethod(
+                    lambda kwargs: dict(kwargs) if kwargs else {}
+                )
+            },
+        )()
 
     def get_tokenizer(self) -> DummyTokenizer:
         return self.tokenizer
@@ -387,12 +396,12 @@ def test_apertus_processor_image_placeholder_present_but_missing_input():
     processor = build_processor(tokenizer)
     install_fake_encoders(processor)
 
-    with pytest.raises(ValueError, match="image placeholder/input mismatch"):
-        run_processor(
-            processor,
-            prompt="A <|image|> B",
-            num_images=0,
-        )
+    result = run_processor(
+        processor,
+        prompt="A <|image|> B",
+        num_images=0,
+    )
+    assert result["prompt"] == "A  B"
 
 
 def test_apertus_processor_input_present_but_missing_placeholder():
@@ -413,12 +422,43 @@ def test_apertus_processor_image_input_present_but_missing_placeholder():
     processor = build_processor(tokenizer)
     install_fake_encoders(processor)
 
-    with pytest.raises(ValueError, match="image placeholder/input mismatch"):
+    with pytest.raises(
+        ValueError,
+        match="Received more images than placeholders",
+    ):
         run_processor(
             processor,
             prompt="A B",
             num_images=1,
         )
+
+
+def test_apertus_processor_more_placeholders_than_images_replaces_extra_with_empty():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="A<|image|>B<|image|>C<|image|>D",
+        num_images=2,
+    )
+
+    assert result["prompt"] == "A<IMG0>B<IMG1>CD"
+
+
+def test_apertus_processor_zero_images_removes_all_image_placeholders():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+
+    result = run_processor(
+        processor,
+        prompt="<|image|>\nNo image provided\n<|image|>",
+        num_images=0,
+    )
+
+    assert result["prompt"] == "\nNo image provided\n"
 
 
 def test_apertus_audio_token_serialization_roundtrip():
@@ -446,23 +486,66 @@ def test_apertus_model_placeholder_str():
     assert ApertusForCausalLM.get_placeholder_str("audio", 0) == "<|audio|>"
 
 
-def test_apertus_emu35_codebase_resolver_requires_env_var(tmp_path):
+def test_apertus_image_placeholder_aliases_include_apertus_default():
+    tokenizer = DummyTokenizer()
+    tokenizer.image_token = "<image>"
+    aliases = ApertusImageTokenizer.placeholder_aliases(tokenizer, {})
+
+    assert aliases == ["<image>", "<|image|>"]
+
+
+def test_apertus_image_placeholder_aliases_allow_explicit_override():
+    tokenizer = DummyTokenizer()
+    aliases = ApertusImageTokenizer.placeholder_aliases(
+        tokenizer,
+        {"apertus_image_placeholder": "<custom-image-token>"},
+    )
+
+    assert aliases == ["<custom-image-token>", "<|image|>"]
+
+
+def test_apertus_emu35_codebase_resolver_prefers_mm_kwargs(tmp_path):
     module_dir = tmp_path / "src" / "vision_tokenizer"
     module_dir.mkdir(parents=True)
     (module_dir / "__init__.py").write_text("", encoding="utf-8")
 
-    with pytest.raises(FileNotFoundError,
-                       match="VLLM_APERTUS_EMU35_CODEBASE"):
-        resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)})
+    assert resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)}) == tmp_path
 
 
-def test_apertus_emu35_codebase_resolver_uses_env_var_only(tmp_path, monkeypatch):
+def test_apertus_emu35_codebase_resolver_uses_env_var(tmp_path, monkeypatch):
     module_dir = tmp_path / "src" / "vision_tokenizer"
     module_dir.mkdir(parents=True)
     (module_dir / "__init__.py").write_text("", encoding="utf-8")
     monkeypatch.setenv("VLLM_APERTUS_EMU35_CODEBASE", str(tmp_path))
 
     assert resolve_emu35_codebase({}) == tmp_path
+
+
+def test_apertus_vision_tokenizer_device_resolution_priority(monkeypatch):
+    tokenizer = ApertusImageTokenizer()
+
+    monkeypatch.delenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", raising=False)
+    (_, _, device, _, _, source) = tokenizer._resolve_vision_tokenizer_settings({})
+    assert device == "cuda"
+    assert source == "default"
+
+    monkeypatch.setenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", "cpu")
+    (_, _, device, _, _, source) = tokenizer._resolve_vision_tokenizer_settings({})
+    assert device == "cpu"
+    assert source == "env:VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
+
+    (
+        _,
+        _,
+        device,
+        _,
+        _,
+        source,
+    ) = tokenizer._resolve_vision_tokenizer_settings(
+        {"apertus_vision_tokenizer_device": "cuda:1"}
+    )
+    assert device == "cuda:1"
+    assert source == "mm_processor_kwargs"
 
 
 def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
@@ -483,7 +566,7 @@ def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
     assert resolve_apertus_audio_tokenizer_codebase({}) == tmp_path
 
 
-def test_apertus_audio_codebase_resolver_uses_env_var_only(tmp_path):
+def test_apertus_audio_codebase_resolver_uses_env_var_only(tmp_path, monkeypatch):
     paths = [
         tmp_path
         / "src"
@@ -496,6 +579,7 @@ def test_apertus_audio_codebase_resolver_uses_env_var_only(tmp_path):
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
+    monkeypatch.delenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", raising=False)
 
     with pytest.raises(FileNotFoundError,
                        match="VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"):
