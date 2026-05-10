@@ -38,6 +38,7 @@ _EMU35_VISION_TOKENIZER_MODULE_PREFIX = "_vllm_apertus_emu35_vision_tokenizer"
 _EMU35_VQ_REQUIRED_FILES = ("config.yaml", "model.ckpt")
 _APERTUS_EMU35_CODEBASE_ENV_VAR = "VLLM_APERTUS_EMU35_CODEBASE"
 _APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR = "VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"
+_APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR = "VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
 
 
 def get_default_apertus_cache_dir() -> Path:
@@ -100,16 +101,31 @@ def ensure_local_emu35_weights(
 
 
 def resolve_emu35_codebase(mm_processor_kwargs: Mapping[str, object]) -> Path:
-    # Intentionally ignore per-request overrides. The EMU3.5 codebase path
-    # must come from the dedicated environment variable.
-    del mm_processor_kwargs
+    configured_codebase = mm_processor_kwargs.get("apertus_emu35_codebase")
+    configured_candidate: Path | None = None
+    if isinstance(configured_codebase, str) and configured_codebase.strip():
+        configured_candidate = Path(
+            os.path.expandvars(configured_codebase.strip())
+        ).expanduser()
+        module_path = (
+            configured_candidate / "src" / "vision_tokenizer" / "__init__.py"
+        )
+        if module_path.is_file():
+            return configured_candidate.resolve()
+
+        raise FileNotFoundError(
+            "Unable to locate Emu3.5 vision tokenizer code from "
+            f"apertus_emu35_codebase={configured_candidate}. Expected a checkout "
+            "with `src/vision_tokenizer/__init__.py`."
+        )
 
     env_value = os.getenv(_APERTUS_EMU35_CODEBASE_ENV_VAR)
     if not env_value or not env_value.strip():
         raise FileNotFoundError(
             "Unable to locate Emu3.5 vision tokenizer code. Set "
-            f"{_APERTUS_EMU35_CODEBASE_ENV_VAR}. Expected a checkout "
-            "with `src/vision_tokenizer/__init__.py`."
+            f"apertus_emu35_codebase in mm_processor_kwargs or "
+            f"{_APERTUS_EMU35_CODEBASE_ENV_VAR}. Expected a checkout with "
+            "`src/vision_tokenizer/__init__.py`."
         )
 
     candidate = Path(os.path.expandvars(env_value.strip())).expanduser()
@@ -371,21 +387,38 @@ class ApertusImageTokenizer:
             configured_placeholder if isinstance(configured_placeholder, str) else "",
             tokenizer_placeholder if isinstance(tokenizer_placeholder, str) else "",
             cls.DEFAULT_IMAGE_PLACEHOLDER,
-            "<image>",
         ]
 
         seen: set[str] = set()
         aliases: list[str] = []
         for candidate in candidates:
-            if candidate and candidate not in seen:
-                seen.add(candidate)
-                aliases.append(candidate)
+            stripped = candidate.strip()
+            if stripped and stripped not in seen:
+                seen.add(stripped)
+                aliases.append(stripped)
         return aliases
+
+    @staticmethod
+    def _resolve_vision_tokenizer_device(
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> tuple[str, str]:
+        from_kwargs = mm_processor_kwargs.get("apertus_vision_tokenizer_device")
+        if isinstance(from_kwargs, str) and from_kwargs.strip():
+            return from_kwargs.strip(), "mm_processor_kwargs"
+
+        from_env = os.getenv(_APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR)
+        if from_env and from_env.strip():
+            return (
+                from_env.strip(),
+                f"env:{_APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR}",
+            )
+
+        return "cuda", "default"
 
     def _resolve_vision_tokenizer_settings(
         self,
         mm_processor_kwargs: Mapping[str, object],
-    ) -> tuple[str, str, str, torch.dtype, bool]:
+    ) -> tuple[str, str, str, torch.dtype, bool, str]:
         vq_hub = str(
             mm_processor_kwargs.get(
                 "apertus_vq_hub",
@@ -398,8 +431,8 @@ class ApertusImageTokenizer:
                 mm_processor_kwargs.get("vq_type", "ibq"),
             )
         )
-        vision_device = str(
-            mm_processor_kwargs.get("apertus_vision_tokenizer_device", "cuda")
+        vision_device, vision_device_source = self._resolve_vision_tokenizer_device(
+            mm_processor_kwargs
         )
         vision_dtype = self.coerce_dtype(
             mm_processor_kwargs.get("apertus_vision_tokenizer_dtype")
@@ -410,7 +443,14 @@ class ApertusImageTokenizer:
         trust_remote_code = bool(
             mm_processor_kwargs.get("apertus_vq_trust_remote_code", True)
         )
-        return vq_hub, vq_type, vision_device, vision_dtype, trust_remote_code
+        return (
+            vq_hub,
+            vq_type,
+            vision_device,
+            vision_dtype,
+            trust_remote_code,
+            vision_device_source,
+        )
 
     def _get_or_init_image_prompt_cache(self) -> ApertusImageTokenizationCache | None:
         if self._image_prompt_cache is not None:
@@ -438,8 +478,32 @@ class ApertusImageTokenizer:
             vision_device,
             vision_dtype,
             trust_remote_code,
+            vision_device_source,
         ) = self._resolve_vision_tokenizer_settings(mm_processor_kwargs)
+        apertus_mm_keys = sorted(
+            key for key in mm_processor_kwargs if key.startswith("apertus_")
+        )
+        codebase_value = mm_processor_kwargs.get("apertus_emu35_codebase")
+        codebase_source = (
+            "mm_processor_kwargs"
+            if isinstance(codebase_value, str) and codebase_value.strip()
+            else f"env:{_APERTUS_EMU35_CODEBASE_ENV_VAR}"
+        )
         emu35_codebase = resolve_emu35_codebase(mm_processor_kwargs)
+        logger.info(
+            "[Apertus MM] received mm_processor_kwargs keys=%s",
+            apertus_mm_keys,
+        )
+        logger.info(
+            "[Apertus MM] resolved apertus_vision_tokenizer_device=%r source=%r",
+            vision_device,
+            vision_device_source,
+        )
+        logger.info(
+            "[Apertus MM] resolved apertus_emu35_codebase=%r source=%r",
+            str(emu35_codebase),
+            codebase_source,
+        )
         cache_key = (
             vq_hub,
             vq_type,
@@ -457,6 +521,11 @@ class ApertusImageTokenizer:
             "trust_remote_code": trust_remote_code,
         }
         cache_base_dir = mm_processor_kwargs.get("apertus_vq_cache_dir")
+        logger.info(
+            "[Apertus MM] loading Emu3.5 vision tokenizer from %r on device=%r",
+            str(emu35_codebase),
+            vision_device,
+        )
         vision_tokenizer = build_emu35_vision_tokenizer(
             emu35_codebase=emu35_codebase,
             vq_hub=vq_hub,
@@ -541,6 +610,7 @@ class ApertusImageTokenizer:
             vision_device_name,
             vision_dtype_name,
             _trust_remote_code,
+            _vision_device_source,
         ) = self._resolve_vision_tokenizer_settings(mm_processor_kwargs)
 
         boi_token = self.apertus_special_token(
