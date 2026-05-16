@@ -61,21 +61,22 @@ class ApertusImageTokenizationCache:
             logger.info(
                 "Apertus image token cache enabled at %s "
                 "(sqlite_db=%s, mode=%s, memory_cache_size=%d, "
-                "sqlite_busy_timeout_ms=%d, sqlite_mmap_size=%d).",
+                "sqlite_busy_timeout_ms=%d, sqlite_mmap_size=%d, preload=%s).",
                 config.cache_dir,
                 config.sqlite_db_path,
                 self._cache_mode,
                 config.memory_cache_size,
                 config.sqlite_busy_timeout_ms,
                 config.sqlite_mmap_size,
+                config.preload,
             )
             logger.info(
                 "Apertus image token cache in-memory cache is unbounded for this "
                 "backend; %s is accepted but ignored for eviction.",
                 config.MEMORY_SIZE_ENV,
             )
-            # Initialize the SQLite backend eagerly so preload happens before
-            # the first cache lookup.
+            # Initialize eagerly so DB/table setup happens even before first
+            # cache lookup; SQLite preload remains opt-in.
             self._ensure_disk_backend()
 
     @property
@@ -131,14 +132,23 @@ class ApertusImageTokenizationCache:
                 sqlite_db_path,
                 self._elapsed_ms(start),
             )
-            if had_existing_db:
-                self._preload_memory_cache(self._disk_backend)
+            if self._config.preload:
+                if had_existing_db:
+                    self._preload_memory_cache(self._disk_backend)
+                else:
+                    self._preload_attempted = True
+                    logger.info(
+                        "Apertus image token cache preload skipped mode=%s "
+                        "(database did not exist before initialization).",
+                        self._cache_mode,
+                    )
             else:
                 self._preload_attempted = True
                 logger.info(
-                    "Apertus image token cache preload skipped mode=%s "
-                    "(database did not exist before initialization).",
+                    "Apertus image token cache preload disabled mode=%s "
+                    "(set %s=1/true/yes/on to enable).",
                     self._cache_mode,
+                    self._config.PRELOAD_ENV,
                 )
             return self._disk_backend
         except Exception as exc:

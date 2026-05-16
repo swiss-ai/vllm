@@ -43,6 +43,9 @@ class ApertusImageTokenCacheConfig:
     sqlite_mmap_size: int
     debug_logging: bool
     disabled_reason: str | None
+    preload: bool = False
+    readonly: bool = False
+    write_misses: bool = True
 
     CACHE_DIR_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_DIR"
     COLLISION_GUARD_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_COLLISION_GUARD"
@@ -50,6 +53,9 @@ class ApertusImageTokenCacheConfig:
     SQLITE_BUSY_TIMEOUT_ENV = "VLLM_APERTUS_IMAGE_TOKEN_SQLITE_BUSY_TIMEOUT_MS"
     SQLITE_MMAP_SIZE_ENV = "VLLM_APERTUS_IMAGE_TOKEN_SQLITE_MMAP_SIZE"
     DEBUG_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_DEBUG"
+    PRELOAD_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_PRELOAD"
+    READONLY_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_READONLY"
+    WRITE_MISSES_ENV = "VLLM_APERTUS_IMAGE_TOKEN_CACHE_WRITE_MISSES"
 
     DEFAULT_MEMORY_CACHE_SIZE = 131072
     DEFAULT_SQLITE_BUSY_TIMEOUT_MS = 5000
@@ -96,6 +102,18 @@ class ApertusImageTokenCacheConfig:
             os.getenv(cls.DEBUG_ENV),
             default=False,
         )
+        preload = _coerce_bool(
+            os.getenv(cls.PRELOAD_ENV),
+            default=False,
+        )
+        readonly = _coerce_bool(
+            os.getenv(cls.READONLY_ENV),
+            default=False,
+        )
+        write_misses = _coerce_bool(
+            os.getenv(cls.WRITE_MISSES_ENV),
+            default=True,
+        )
 
         cache_dir_value = os.getenv(cls.CACHE_DIR_ENV)
         if not isinstance(cache_dir_value, str) or not cache_dir_value.strip():
@@ -107,6 +125,9 @@ class ApertusImageTokenCacheConfig:
                 sqlite_mmap_size=sqlite_mmap_size,
                 debug_logging=debug_logging,
                 disabled_reason=f"{cls.CACHE_DIR_ENV} is unset or empty.",
+                preload=preload,
+                readonly=readonly,
+                write_misses=write_misses,
             )
 
         cache_dir = Path(os.path.expandvars(cache_dir_value.strip())).expanduser()
@@ -122,6 +143,9 @@ class ApertusImageTokenCacheConfig:
                     f"{cls.CACHE_DIR_ENV} points to a non-existing or non-directory "
                     f"path: {cache_dir}"
                 ),
+                preload=preload,
+                readonly=readonly,
+                write_misses=write_misses,
             )
 
         return cls(
@@ -132,4 +156,7 @@ class ApertusImageTokenCacheConfig:
             sqlite_mmap_size=sqlite_mmap_size,
             debug_logging=debug_logging,
             disabled_reason=None,
+            preload=preload,
+            readonly=readonly,
+            write_misses=write_misses,
         )

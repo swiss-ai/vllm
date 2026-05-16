@@ -604,6 +604,7 @@ def test_preload_loads_active_mode_only(monkeypatch, tmp_path):
     cache_dir.mkdir(parents=True)
 
     monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_DIR", str(cache_dir))
+    monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_PRELOAD", "1")
     monkeypatch.delenv(
         "VLLM_APERTUS_IMAGE_TOKEN_CACHE_COLLISION_GUARD",
         raising=False,
@@ -671,6 +672,7 @@ def test_preload_ignores_memory_cap_and_loads_all_rows(tmp_path):
             sqlite_mmap_size=1024 * 1024,
             debug_logging=False,
             disabled_reason=None,
+            preload=False,
         )
     )
     for idx in range(20):
@@ -686,6 +688,7 @@ def test_preload_ignores_memory_cap_and_loads_all_rows(tmp_path):
             sqlite_mmap_size=1024 * 1024,
             debug_logging=False,
             disabled_reason=None,
+            preload=True,
         )
     )
     stats = reader.get_stats()
@@ -696,6 +699,68 @@ def test_preload_ignores_memory_cap_and_loads_all_rows(tmp_path):
     assert stats_after["memory_hits"] >= 20
     assert stats_after["sqlite_hits"] == 0
     reader.close()
+
+
+def test_preload_disabled_default_uses_lazy_sqlite_reads(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+
+    writer = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+            preload=False,
+        )
+    )
+    writer.put("lazy-key", "lazy-value")
+    writer.close()
+
+    reader = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+        )
+    )
+
+    stats_before = reader.get_stats()
+    assert stats_before["preload_rows_loaded"] == 0
+
+    assert reader.get("lazy-key") == "lazy-value"
+    stats_after_first_get = reader.get_stats()
+    assert stats_after_first_get["sqlite_hits"] >= 1
+    assert stats_after_first_get["memory_hits"] == 0
+
+    assert reader.get("lazy-key") == "lazy-value"
+    stats_after_second_get = reader.get_stats()
+    assert stats_after_second_get["memory_hits"] >= 1
+    reader.close()
+
+
+def test_preload_env_parsing_defaults_to_false(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_DIR", str(cache_dir))
+
+    monkeypatch.delenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_PRELOAD", raising=False)
+    assert ApertusImageTokenCacheConfig.from_env().preload is False
+
+    for value in ("", "0", "false", "no", "off"):
+        monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_PRELOAD", value)
+        assert ApertusImageTokenCacheConfig.from_env().preload is False
+
+    for value in ("1", "true", "yes", "on"):
+        monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_PRELOAD", value)
+        assert ApertusImageTokenCacheConfig.from_env().preload is True
 
 
 def test_multi_process_shared_sqlite_read_write_stress(tmp_path):
