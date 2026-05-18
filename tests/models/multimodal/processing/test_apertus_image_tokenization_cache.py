@@ -763,6 +763,112 @@ def test_preload_env_parsing_defaults_to_false(monkeypatch, tmp_path):
         assert ApertusImageTokenCacheConfig.from_env().preload is True
 
 
+def test_readonly_and_write_misses_env_parsing(monkeypatch, tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+    monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_DIR", str(cache_dir))
+
+    monkeypatch.delenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_READONLY", raising=False)
+    monkeypatch.delenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_WRITE_MISSES", raising=False)
+    cfg_default = ApertusImageTokenCacheConfig.from_env()
+    assert cfg_default.readonly is False
+    assert cfg_default.write_misses is True
+
+    monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_READONLY", "1")
+    monkeypatch.setenv("VLLM_APERTUS_IMAGE_TOKEN_CACHE_WRITE_MISSES", "0")
+    cfg = ApertusImageTokenCacheConfig.from_env()
+    assert cfg.readonly is True
+    assert cfg.write_misses is False
+
+
+def test_readonly_mode_reads_existing_db_and_skips_db_writes(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+
+    writer = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+            readonly=False,
+            write_misses=True,
+        )
+    )
+    writer.put("seed-key", "seed-value")
+    writer.close()
+
+    reader = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+            readonly=True,
+            write_misses=False,
+        )
+    )
+    assert reader.get("seed-key") == "seed-value"
+    reader.put("new-key", "new-value")
+    # In readonly mode, puts are memory-only for the current process.
+    assert reader.get("new-key") == "new-value"
+    reader.close()
+
+    conn = sqlite3.connect(str(_sqlite_db_path(cache_dir)))
+    try:
+        persisted = conn.execute(
+            "SELECT value FROM image_token_cache "
+            "WHERE mode='normal' AND cache_key='new-key';"
+        ).fetchone()
+        assert persisted is None
+    finally:
+        conn.close()
+
+
+def test_write_misses_disabled_keeps_entries_memory_only(tmp_path):
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True)
+
+    cache = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+            readonly=False,
+            write_misses=False,
+        )
+    )
+    cache.put("mem-only-key", "mem-only-value")
+    assert cache.get("mem-only-key") == "mem-only-value"
+    cache.close()
+
+    fresh = ApertusImageTokenizationCache(
+        ApertusImageTokenCacheConfig(
+            cache_dir=cache_dir,
+            collision_guard=False,
+            memory_cache_size=8,
+            sqlite_busy_timeout_ms=5000,
+            sqlite_mmap_size=1024 * 1024,
+            debug_logging=False,
+            disabled_reason=None,
+            readonly=False,
+            write_misses=True,
+        )
+    )
+    assert fresh.get("mem-only-key") is None
+    fresh.close()
+
+
 def test_multi_process_shared_sqlite_read_write_stress(tmp_path):
     cache_dir = tmp_path / "cache"
     cache_dir.mkdir(parents=True)

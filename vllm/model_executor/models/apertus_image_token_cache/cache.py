@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +41,11 @@ class _CacheStats:
 
 
 class ApertusImageTokenizationCache:
+    # Process-local guard to ensure SQLite full preload happens only once per
+    # (db_path, cache_mode) even if multiple processor/cache instances are built.
+    _process_preload_lock = threading.Lock()
+    _process_preload_done: set[tuple[str, str]] = set()
+
     def __init__(self, config: ApertusImageTokenCacheConfig) -> None:
         self._config = config
         self._memory: ThreadSafeLRUCache[str, str | CollisionGuardCacheRecord] = (
@@ -61,7 +67,8 @@ class ApertusImageTokenizationCache:
             logger.info(
                 "Apertus image token cache enabled at %s "
                 "(sqlite_db=%s, mode=%s, memory_cache_size=%d, "
-                "sqlite_busy_timeout_ms=%d, sqlite_mmap_size=%d, preload=%s).",
+                "sqlite_busy_timeout_ms=%d, sqlite_mmap_size=%d, preload=%s, "
+                "readonly=%s, write_misses=%s).",
                 config.cache_dir,
                 config.sqlite_db_path,
                 self._cache_mode,
@@ -69,6 +76,8 @@ class ApertusImageTokenizationCache:
                 config.sqlite_busy_timeout_ms,
                 config.sqlite_mmap_size,
                 config.preload,
+                config.readonly,
+                config.write_misses,
             )
             logger.info(
                 "Apertus image token cache in-memory cache is unbounded for this "
@@ -118,11 +127,18 @@ class ApertusImageTokenizationCache:
         start = time.perf_counter()
         had_existing_db = sqlite_db_path.exists()
         try:
-            sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
+            if self._config.readonly:
+                if not had_existing_db:
+                    raise FileNotFoundError(
+                        f"Readonly cache requires existing SQLite DB at {sqlite_db_path}"
+                    )
+            else:
+                sqlite_db_path.parent.mkdir(parents=True, exist_ok=True)
             self._disk_backend = SQLiteImagePromptBackend(
                 db_path=sqlite_db_path,
                 busy_timeout_ms=self._config.sqlite_busy_timeout_ms,
                 mmap_size=self._config.sqlite_mmap_size,
+                readonly=self._config.readonly,
             )
             # Force open + pragma setup once so open timing can be observed.
             self._disk_backend.get(mode=self._cache_mode, key="__warmup__")
@@ -335,6 +351,16 @@ class ApertusImageTokenizationCache:
         if self._preload_attempted:
             return
         self._preload_attempted = True
+        preload_key = (str(backend.db_path), self._cache_mode)
+        with self._process_preload_lock:
+            if preload_key in self._process_preload_done:
+                logger.info(
+                    "Apertus image token cache preload skipped mode=%s "
+                    "(already completed in this process for db=%s).",
+                    self._cache_mode,
+                    backend.db_path,
+                )
+                return
         logger.info(
             "Apertus image token cache preload started mode=%s",
             self._cache_mode,
@@ -343,6 +369,7 @@ class ApertusImageTokenizationCache:
 
         loaded = 0
         loaded_bytes = 0
+        preload_succeeded = False
         try:
             rows = backend.preload_rows(mode=self._cache_mode, max_entries=None)
             for cache_key, value in rows:
@@ -355,6 +382,7 @@ class ApertusImageTokenizationCache:
                 else:
                     self._memory.put(cache_key, value.decode("utf-8"))
                 loaded += 1
+            preload_succeeded = True
         except Exception as exc:
             self._increment_stat("preload_failures")
             logger.warning(
@@ -368,6 +396,9 @@ class ApertusImageTokenizationCache:
             self._stats.preload_time_ms += elapsed_ms
             self._stats.preload_rows_loaded += loaded
             self._stats.preload_bytes_loaded += loaded_bytes
+            if preload_succeeded:
+                with self._process_preload_lock:
+                    self._process_preload_done.add(preload_key)
             logger.info(
                 "Apertus image token cache preload complete mode=%s rows=%d bytes=%d "
                 "elapsed_ms=%d",
@@ -473,6 +504,20 @@ class ApertusImageTokenizationCache:
             )
         else:
             self._memory.put(cache_key, prompt)
+
+        if self._config.readonly:
+            self._debug(
+                "Apertus image token cache write skipped key=%s (readonly enabled)",
+                cache_key,
+            )
+            return
+        if not self._config.write_misses:
+            self._debug(
+                "Apertus image token cache write skipped key=%s "
+                "(write misses disabled)",
+                cache_key,
+            )
+            return
 
         backend = self._ensure_disk_backend()
         if backend is None:

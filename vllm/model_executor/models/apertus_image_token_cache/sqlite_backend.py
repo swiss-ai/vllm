@@ -22,10 +22,12 @@ class SQLiteImagePromptBackend:
         db_path: Path,
         busy_timeout_ms: int,
         mmap_size: int,
+        readonly: bool = False,
     ) -> None:
         self._db_path = db_path.resolve()
         self._busy_timeout_ms = max(1, int(busy_timeout_ms))
         self._mmap_size = max(0, int(mmap_size))
+        self._readonly = bool(readonly)
         self._connection: sqlite3.Connection | None = None
         self._lock = threading.Lock()
 
@@ -33,25 +35,37 @@ class SQLiteImagePromptBackend:
     def db_path(self) -> Path:
         return self._db_path
 
+    @property
+    def readonly(self) -> bool:
+        return self._readonly
+
     def _ensure_connection(self) -> sqlite3.Connection:
         with self._lock:
             if self._connection is not None:
                 return self._connection
 
-            self._connection = sqlite3.connect(
-                str(self._db_path),
-                timeout=self._busy_timeout_ms / 1000.0,
-                isolation_level=None,
-                check_same_thread=False,
-            )
+            connect_target = str(self._db_path)
+            connect_kwargs: dict[str, object] = {
+                "timeout": self._busy_timeout_ms / 1000.0,
+                "isolation_level": None,
+                "check_same_thread": False,
+            }
+            if self._readonly:
+                connect_target = f"file:{self._db_path}?mode=ro"
+                connect_kwargs["uri"] = True
+
+            self._connection = sqlite3.connect(connect_target, **connect_kwargs)
             self._connection.execute(
                 f"PRAGMA busy_timeout={self._busy_timeout_ms};"
             ).close()
-            self._connection.execute("PRAGMA journal_mode=WAL;").fetchone()
-            self._connection.execute("PRAGMA synchronous=NORMAL;").close()
             self._connection.execute("PRAGMA temp_store=MEMORY;").close()
             self._connection.execute(f"PRAGMA mmap_size={self._mmap_size};").close()
-            self._connection.execute(SQLITE_SCHEMA).close()
+            if self._readonly:
+                self._connection.execute("PRAGMA query_only=ON;").close()
+            else:
+                self._connection.execute("PRAGMA journal_mode=WAL;").fetchone()
+                self._connection.execute("PRAGMA synchronous=NORMAL;").close()
+                self._connection.execute(SQLITE_SCHEMA).close()
             return self._connection
 
     def get(self, *, mode: str, key: str) -> bytes | None:
@@ -68,6 +82,8 @@ class SQLiteImagePromptBackend:
         return bytes(row[0])
 
     def put_if_absent(self, *, mode: str, key: str, value: bytes) -> bool:
+        if self._readonly:
+            return False
         connection = self._ensure_connection()
         with self._lock:
             cursor = connection.execute(
