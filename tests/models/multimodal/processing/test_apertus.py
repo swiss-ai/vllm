@@ -525,23 +525,16 @@ def test_apertus_vision_tokenizer_device_resolution_priority(monkeypatch):
     tokenizer = ApertusImageTokenizer()
 
     monkeypatch.delenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", raising=False)
-    (_, _, device, _, _, source) = tokenizer._resolve_vision_tokenizer_settings({})
+    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
     assert device == "cuda"
     assert source == "default"
 
     monkeypatch.setenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", "cpu")
-    (_, _, device, _, _, source) = tokenizer._resolve_vision_tokenizer_settings({})
+    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
     assert device == "cpu"
     assert source == "env:VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
 
-    (
-        _,
-        _,
-        device,
-        _,
-        _,
-        source,
-    ) = tokenizer._resolve_vision_tokenizer_settings(
+    (device, source) = tokenizer._resolve_vision_tokenizer_device(
         {"apertus_vision_tokenizer_device": "cuda:1"}
     )
     assert device == "cuda:1"
