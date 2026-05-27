@@ -36,6 +36,11 @@ logger = init_logger(__name__)
 
 _EMU35_VISION_TOKENIZER_MODULE_PREFIX = "_vllm_apertus_emu35_vision_tokenizer"
 _EMU35_VQ_REQUIRED_FILES = ("config.yaml", "model.ckpt")
+_APERTUS_AUDIO_TOKENIZER_REQUIRED_FILES = (
+    "src/audio_tokenizers/implementations/wavtokenizer.py",
+    "src/repos/wavtokenizer/encoder/utils.py",
+    "src/repos/wavtokenizer/decoder/pretrained.py",
+)
 _APERTUS_EMU35_CODEBASE_ENV_VAR = "VLLM_APERTUS_EMU35_CODEBASE"
 _APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR = "VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"
 _APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR = "VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
@@ -752,9 +757,21 @@ class ApertusImageTokenizer:
 def resolve_apertus_audio_tokenizer_codebase(
     mm_processor_kwargs: Mapping[str, object],
 ) -> Path:
-    # Intentionally ignore per-request overrides. The audio tokenizer codebase
-    # path must come from the dedicated environment variable.
-    del mm_processor_kwargs
+    def _resolve_candidate(raw_value: str, *, source: str) -> Path:
+        candidate = Path(os.path.expandvars(raw_value.strip())).expanduser()
+        if has_required_files(candidate, _APERTUS_AUDIO_TOKENIZER_REQUIRED_FILES):
+            return candidate.resolve()
+        raise FileNotFoundError(
+            "Unable to locate a complete benchmark-audio-tokenizer checkout from "
+            f"{source}={candidate}."
+        )
+
+    configured_codebase = mm_processor_kwargs.get("apertus_audio_tokenizer_codebase")
+    if isinstance(configured_codebase, str) and configured_codebase.strip():
+        return _resolve_candidate(
+            configured_codebase,
+            source="apertus_audio_tokenizer_codebase",
+        )
 
     env_value = os.getenv(_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR)
     if not env_value or not env_value.strip():
@@ -764,24 +781,9 @@ def resolve_apertus_audio_tokenizer_codebase(
             f"{_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR}."
         )
 
-    candidate = Path(os.path.expandvars(env_value.strip())).expanduser()
-    if all(
-        path.is_file()
-        for path in (
-            candidate
-            / "src"
-            / "audio_tokenizers"
-            / "implementations"
-            / "wavtokenizer.py",
-            candidate / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-            candidate / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-        )
-    ):
-        return candidate.resolve()
-
-    raise FileNotFoundError(
-        "Unable to locate a complete benchmark-audio-tokenizer checkout from "
-        f"{_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR}={candidate}."
+    return _resolve_candidate(
+        env_value,
+        source=_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR,
     )
 
 
@@ -885,43 +887,22 @@ class ApertusAudioTokenizer:
     def normalize_audio_input(
         self,
         item: object,
-        mm_processor_kwargs: Mapping[str, object],
-    ) -> tuple[np.ndarray, int]:
-        target_sr = self.coerce_int(
-            mm_processor_kwargs.get("apertus_audio_target_sampling_rate"),
-            default=self.DEFAULT_TARGET_SAMPLING_RATE,
-        )
-
+    ) -> np.ndarray:
         if isinstance(item, tuple) and len(item) == 2:
-            waveform = self.coerce_audio_waveform(item[0])
-            return waveform, int(item[1])
+            return self.coerce_audio_waveform(item[0])
 
         if isinstance(item, Mapping):
             if "array" in item:
-                sr = item.get("sampling_rate", item.get("sample_rate", target_sr))
-                waveform = self.coerce_audio_waveform(item["array"])
-                return waveform, int(sr)
+                return self.coerce_audio_waveform(item["array"])
             if "audio_array" in item:
-                sr = item.get(
-                    "sr",
-                    item.get(
-                        "sampling_rate",
-                        item.get("sample_rate", target_sr),
-                    ),
-                )
-                waveform = self.coerce_audio_waveform(item["audio_array"])
-                return waveform, int(sr)
+                return self.coerce_audio_waveform(item["audio_array"])
 
             raise TypeError(
                 "Unsupported mapping keys for Apertus audio input. "
                 f"Got keys: {sorted(item.keys())}"
             )
 
-        # vLLM's MultiModalDataParser resamples tuple inputs to target_sr and
-        # then drops sampling-rate metadata, leaving a bare waveform array.
-        # Treat bare arrays as already being at target_sr to avoid accidental
-        # time-stretching (e.g., 24kHz interpreted as 16kHz).
-        return self.coerce_audio_waveform(item), target_sr
+        return self.coerce_audio_waveform(item)
 
     @staticmethod
     def to_audio_tensor(waveform: np.ndarray) -> torch.Tensor:
@@ -1085,10 +1066,7 @@ class ApertusAudioTokenizer:
 
         serialized_prompts: list[str] = []
         for raw_audio in audios:
-            waveform, _ = self.normalize_audio_input(
-                raw_audio,
-                mm_processor_kwargs,
-            )
+            waveform = self.normalize_audio_input(raw_audio)
             audio_tensor = self.to_audio_tensor(waveform)
 
             # Match benchmark script default: peak-normalize to target dBFS.

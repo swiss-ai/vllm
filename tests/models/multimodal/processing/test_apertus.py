@@ -559,23 +559,28 @@ def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
     assert resolve_apertus_audio_tokenizer_codebase({}) == tmp_path
 
 
-def test_apertus_audio_codebase_resolver_uses_env_var_only(tmp_path, monkeypatch):
+def test_apertus_audio_codebase_resolver_accepts_mm_processor_kwargs(
+    tmp_path, monkeypatch
+):
+    kwargs_path = tmp_path / "kwargs_codebase"
+    env_path = tmp_path / "env_codebase"
     paths = [
-        tmp_path
+        kwargs_path
         / "src"
         / "audio_tokenizers"
         / "implementations"
         / "wavtokenizer.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+        kwargs_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
+        kwargs_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+        env_path / "src" / "audio_tokenizers" / "implementations" / "wavtokenizer.py",
+        env_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
+        env_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
     ]
     for path in paths:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("", encoding="utf-8")
-    monkeypatch.delenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", raising=False)
+    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(env_path))
 
-    with pytest.raises(FileNotFoundError,
-                       match="VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"):
-        resolve_apertus_audio_tokenizer_codebase(
-            {"apertus_audio_tokenizer_codebase": str(tmp_path)}
-        )
+    assert resolve_apertus_audio_tokenizer_codebase(
+        {"apertus_audio_tokenizer_codebase": str(kwargs_path)}
+    ) == kwargs_path

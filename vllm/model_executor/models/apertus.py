@@ -151,7 +151,7 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
                 overrides=image_overrides,
             ),
             "audio": self._get_dummy_audios(
-                length=16000,
+                length=24000,
                 num_audios=num_audios,
                 overrides=audio_overrides,
             ),
@@ -277,12 +277,6 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             image_placeholders = []
 
         if num_images == 0 and num_audios == 0:
-            if image_placeholders:
-                raise ValueError(
-                    "Apertus image placeholder/input mismatch: found "
-                    f"{len(image_placeholders)} placeholder(s) in the prompt "
-                    f"using aliases {image_aliases}, but received 0 image input(s)."
-                )
             if audio_placeholders:
                 raise ValueError(
                     "Apertus audio placeholder/input mismatch: found "
