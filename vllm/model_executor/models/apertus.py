@@ -68,6 +68,7 @@ from vllm.multimodal.parse import (
     AudioProcessorItems,
     ImageProcessorItems,
     MultiModalDataItems,
+    MultiModalDataParser,
 )
 from vllm.multimodal.processing import (
     BaseDummyInputsBuilder,
@@ -108,6 +109,14 @@ logger = init_logger(__name__)
 class ApertusProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> ApertusConfig:
         return self.ctx.get_hf_config(ApertusConfig)
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        # Apertus audio tokenizer expects mono waveform at 24kHz.
+        return MultiModalDataParser(
+            target_sr=ApertusAudioTokenizer.DEFAULT_TARGET_SAMPLING_RATE,
+            target_channels=1,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None, "audio": None}
@@ -302,7 +311,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 image_items = inputs.mm_data_items.get_items(
                     "image", ImageProcessorItems
                 )
-                images = [image_items[idx] for idx in range(len(image_items))]
+                images = image_items.get_all()
                 image_prompts = self.image_tokenizer.encode_images(
                     images,
                     tokenizer=tokenizer,
@@ -341,7 +350,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 audio_items = inputs.mm_data_items.get_items(
                     "audio", AudioProcessorItems
                 )
-                audios = [audio_items[idx] for idx in range(len(audio_items))]
+                audios = audio_items.get_all()
                 audio_prompts = self.audio_tokenizer.encode_audios(
                     audios,
                     tokenizer=tokenizer,
