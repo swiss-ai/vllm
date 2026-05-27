@@ -811,20 +811,10 @@ class ApertusAudioTokenizer:
     DEFAULT_AUDIO_TOKENIZER_NAME = "WavTokenizer40"
     DEFAULT_AUDIO_TOKENIZER_DEVICE = "cuda"
     DEFAULT_TARGET_SAMPLING_RATE = 24000
-    DEFAULT_INPUT_SAMPLING_RATE = 16000
+    DEFAULT_TARGET_PEAK_DBFS = -3.0
     DEFAULT_AUDIO_TOKEN_OFFSET = 262344
-    DEFAULT_AUDIO_VOCAB_SIZE = 4096
     DEFAULT_AUDIO_START_TOKEN = "<|audio_start|>"
     DEFAULT_AUDIO_END_TOKEN = "<|audio_end|>"
-    DEFAULT_STT_TRANSCRIBE_TOKEN = "<|stt_transcribe|>"
-    DEFAULT_STT_CONTINUE_TOKEN = "<|stt_continue|>"
-    DEFAULT_TTS_CONTINUE_TOKEN = "<|tts_continue|>"
-
-    _TASK_TOKENS = {
-        "transcribe": DEFAULT_STT_TRANSCRIBE_TOKEN,
-        "continue": DEFAULT_STT_CONTINUE_TOKEN,
-        "tts_continue": DEFAULT_TTS_CONTINUE_TOKEN,
-    }
 
     def __init__(self) -> None:
         self._audio_tokenizer_cache: dict[
@@ -837,6 +827,15 @@ class ApertusAudioTokenizer:
             return default
         try:
             return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def coerce_float(value: object, *, default: float) -> float:
+        if value is None:
+            return default
+        try:
+            return float(value)
         except (TypeError, ValueError):
             return default
 
@@ -888,9 +887,9 @@ class ApertusAudioTokenizer:
         item: object,
         mm_processor_kwargs: Mapping[str, object],
     ) -> tuple[np.ndarray, int]:
-        default_sr = self.coerce_int(
-            mm_processor_kwargs.get("apertus_audio_default_sampling_rate"),
-            default=self.DEFAULT_INPUT_SAMPLING_RATE,
+        target_sr = self.coerce_int(
+            mm_processor_kwargs.get("apertus_audio_target_sampling_rate"),
+            default=self.DEFAULT_TARGET_SAMPLING_RATE,
         )
 
         if isinstance(item, tuple) and len(item) == 2:
@@ -899,13 +898,16 @@ class ApertusAudioTokenizer:
 
         if isinstance(item, Mapping):
             if "array" in item:
-                sr = item.get("sampling_rate", item.get("sample_rate", default_sr))
+                sr = item.get("sampling_rate", item.get("sample_rate", target_sr))
                 waveform = self.coerce_audio_waveform(item["array"])
                 return waveform, int(sr)
             if "audio_array" in item:
                 sr = item.get(
                     "sr",
-                    item.get("sampling_rate", item.get("sample_rate", default_sr)),
+                    item.get(
+                        "sampling_rate",
+                        item.get("sample_rate", target_sr),
+                    ),
                 )
                 waveform = self.coerce_audio_waveform(item["audio_array"])
                 return waveform, int(sr)
@@ -915,7 +917,11 @@ class ApertusAudioTokenizer:
                 f"Got keys: {sorted(item.keys())}"
             )
 
-        return self.coerce_audio_waveform(item), default_sr
+        # vLLM's MultiModalDataParser resamples tuple inputs to target_sr and
+        # then drops sampling-rate metadata, leaving a bare waveform array.
+        # Treat bare arrays as already being at target_sr to avoid accidental
+        # time-stretching (e.g., 24kHz interpreted as 16kHz).
+        return self.coerce_audio_waveform(item), target_sr
 
     @staticmethod
     def to_audio_tensor(waveform: np.ndarray) -> torch.Tensor:
@@ -1037,8 +1043,6 @@ class ApertusAudioTokenizer:
         self,
         token_ids: Sequence[int],
         tokenizer: TokenizerLike,
-        *,
-        validate_roundtrip: bool = False,
     ) -> str:
         convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
         if callable(convert_ids_to_tokens):
@@ -1048,18 +1052,6 @@ class ApertusAudioTokenizer:
             serialized = "".join(str(token_str) for token_str in token_strs)
         else:
             serialized = tokenizer.decode(list(token_ids), skip_special_tokens=False)
-
-        if validate_roundtrip:
-            roundtrip_ids = list(tokenizer.encode(serialized, add_special_tokens=False))
-            expected_ids = list(token_ids)
-            if roundtrip_ids != expected_ids:
-                raise ValueError(
-                    "Serialized audio token span does not round-trip through "
-                    "the tokenizer. "
-                    f"Expected IDs: {expected_ids[:32]}..."
-                    f" ({len(expected_ids)} total), "
-                    f"got: {roundtrip_ids[:32]}... ({len(roundtrip_ids)} total)."
-                )
 
         return serialized
 
@@ -1073,19 +1065,13 @@ class ApertusAudioTokenizer:
         if not audios:
             return []
 
-        target_sr = self.coerce_int(
-            mm_processor_kwargs.get("apertus_audio_target_sampling_rate"),
-            default=self.DEFAULT_TARGET_SAMPLING_RATE,
-        )
         token_offset = self.coerce_int(
             mm_processor_kwargs.get("apertus_audio_token_offset"),
             default=self.DEFAULT_AUDIO_TOKEN_OFFSET,
         )
-        task = mm_processor_kwargs.get("apertus_audio_task")
-        task_token = self._TASK_TOKENS.get(str(task)) if isinstance(task, str) else None
-        validate_roundtrip = self.coerce_bool(
-            mm_processor_kwargs.get("apertus_audio_validate_roundtrip"),
-            default=False,
+        target_peak_dbfs = self.coerce_float(
+            mm_processor_kwargs.get("apertus_audio_target_peak_dbfs"),
+            default=self.DEFAULT_TARGET_PEAK_DBFS,
         )
 
         audio_tokenizer = self.get_audio_tokenizer(mm_processor_kwargs)
@@ -1096,31 +1082,19 @@ class ApertusAudioTokenizer:
         audio_end_id = self.load_special_token_id(
             tokenizer, self.DEFAULT_AUDIO_END_TOKEN
         )
-        task_token_id = (
-            self.load_special_token_id(tokenizer, task_token)
-            if task_token is not None
-            else None
-        )
 
         serialized_prompts: list[str] = []
         for raw_audio in audios:
-            waveform, source_sr = self.normalize_audio_input(
+            waveform, _ = self.normalize_audio_input(
                 raw_audio,
                 mm_processor_kwargs,
             )
             audio_tensor = self.to_audio_tensor(waveform)
-            if source_sr != target_sr:
-                try:
-                    import torchaudio
-                except ImportError as exc:
-                    raise ImportError(
-                        "torchaudio is required to resample Apertus audio inputs. "
-                        "Install torchaudio or provide audio already sampled at "
-                        f"{target_sr} Hz."
-                    ) from exc
 
-                resampler = torchaudio.transforms.Resample(source_sr, target_sr)
-                audio_tensor = resampler(audio_tensor)
+            # Match benchmark script default: peak-normalize to target dBFS.
+            peak = audio_tensor.abs().max().clamp(min=1e-10)
+            target_peak = 10 ** (target_peak_dbfs / 20.0)
+            audio_tensor = audio_tensor * (target_peak / peak)
 
             audio_tensor = audio_tensor.to(audio_device)
             with torch.no_grad():
@@ -1135,14 +1109,11 @@ class ApertusAudioTokenizer:
             prompt_ids = [audio_start_id]
             prompt_ids.extend(shifted_codes.tolist())
             prompt_ids.append(audio_end_id)
-            if task_token_id is not None:
-                prompt_ids.append(task_token_id)
 
             serialized_prompts.append(
                 self.serialize_audio_token_ids(
                     prompt_ids,
                     tokenizer,
-                    validate_roundtrip=validate_roundtrip,
                 )
             )
 

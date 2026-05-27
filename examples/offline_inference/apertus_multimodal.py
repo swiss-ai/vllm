@@ -95,7 +95,6 @@ def parse_args():
         help="Path to benchmark-audio-tokenizer checkout.",
     )
     parser.add_argument("--audio-target-sampling-rate", type=int, default=24000)
-    parser.add_argument("--audio-default-sampling-rate", type=int, default=16000)
     parser.add_argument("--audio-token-offset", type=int, default=262344)
     parser.add_argument(
         "--expect-substring",
@@ -112,7 +111,6 @@ def build_mm_processor_kwargs(args) -> dict[str, object]:
         "apertus_audio_tokenizer_path": args.audio_tokenizer_path,
         "apertus_audio_tokenizer_device": args.audio_tokenizer_device,
         "apertus_audio_target_sampling_rate": args.audio_target_sampling_rate,
-        "apertus_audio_default_sampling_rate": args.audio_default_sampling_rate,
         "apertus_audio_token_offset": args.audio_token_offset,
     }
     if args.emu35_codebase:
