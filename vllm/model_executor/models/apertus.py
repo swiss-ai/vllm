@@ -121,6 +121,33 @@ class ApertusProcessingInfo(BaseProcessingInfo):
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
         return {"image": None, "audio": None}
 
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int] | None:
+        del mm_counts
+        # Avoid huge dummy-input estimation by using Apertus' known
+        # tokenizer ceilings.
+        ds = ApertusImageTokenizer.EMU35_DS_FACTOR
+        max_px = ApertusImageTokenizer.DEFAULT_MAX_PIXELS
+        base_image_tokens = (max_px // (ds * ds)) + 512
+
+        # WavTokenizer40 emits ~40 codes/sec. Apertus wraps them with
+        # <|audio_start|> and <|audio_end|>.
+        audio_tokens_per_second = 40
+        max_audio_seconds = 300
+        base_audio_tokens = (
+            audio_tokens_per_second * max_audio_seconds
+        ) + 4  # bos, boa, <|audio_start|> and <|audio_end|>
+
+        max_tokens = {
+            "image": min(base_image_tokens, seq_len),
+            "audio": min(base_audio_tokens, seq_len),
+        }
+
+        return max_tokens
+
 
 class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
@@ -137,12 +164,20 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
         mm_counts: Mapping[str, int],
         mm_options: Mapping[str, BaseDummyOptions],
     ) -> MultiModalDataDict:
-        del seq_len
         num_images = mm_counts.get("image", 0)
         num_audios = mm_counts.get("audio", 0)
         image_overrides = mm_options.get("image")
         audio_overrides = mm_options.get("audio")
         max_side = int(ApertusImageTokenizer.DEFAULT_MAX_PIXELS**0.5)
+        
+        audio_tokens_per_second = 40
+        max_audio_seconds = 300
+        audio_token_budget = (audio_tokens_per_second * max_audio_seconds) + 4
+        audio_seconds = max(1, (audio_token_budget - 4) // audio_tokens_per_second)
+        audio_length = (
+            audio_seconds * ApertusAudioTokenizer.DEFAULT_TARGET_SAMPLING_RATE
+        )
+        
         return {
             "image": self._get_dummy_images(
                 width=max_side,
@@ -151,7 +186,7 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
                 overrides=image_overrides,
             ),
             "audio": self._get_dummy_audios(
-                length=24000,
+                length=audio_length,
                 num_audios=num_audios,
                 overrides=audio_overrides,
             ),
