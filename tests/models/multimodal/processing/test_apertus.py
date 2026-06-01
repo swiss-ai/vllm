@@ -475,7 +475,6 @@ def test_apertus_audio_token_serialization_roundtrip():
     serialized = ApertusAudioTokenizer().serialize_audio_token_ids(
         token_ids,
         tokenizer,
-        validate_roundtrip=True,
     )
 
     assert tokenizer.encode(serialized, add_special_tokens=False) == token_ids
