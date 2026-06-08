@@ -57,7 +57,11 @@ def ensure_local_emu35_weights(
     import huggingface_hub
 
     local_only = huggingface_hub.constants.HF_HUB_OFFLINE
-    logger.info("Downloading %s (cache_dir=%s)", hf_repo_id, cache_dir)
+    if local_only:
+        logger.info(
+            "Using cached weights for %s (cache_dir=%s)", hf_repo_id, cache_dir)
+    else:
+        logger.info("Downloading %s (cache_dir=%s)", hf_repo_id, cache_dir)
     hf_folder = huggingface_hub.snapshot_download(
         repo_id=hf_repo_id,
         allow_patterns=list(required_files),
