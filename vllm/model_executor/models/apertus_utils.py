@@ -34,15 +34,6 @@ _APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR = "VLLM_APERTUS_AUDIO_TOKENIZER_CODEBA
 _APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR = "VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
 
 
-def get_default_apertus_cache_dir() -> Path:
-    cache_env = os.getenv("VLLM_APERTUS_MODELS_CACHE") or os.getenv(
-        "LMMS_EVAL_MODELS_CACHE"
-    )
-    if cache_env:
-        return Path(cache_env).expanduser()
-    return Path.home() / ".cache" / "vllm" / "apertus"
-
-
 def has_required_files(path: Path, required_files: Sequence[str]) -> bool:
     return all((path / fname).is_file() for fname in required_files)
 
@@ -52,7 +43,7 @@ def ensure_local_emu35_weights(
     hf_repo_id: str,
     *,
     required_files: Sequence[str] = _EMU35_VQ_REQUIRED_FILES,
-    cache_base_dir: str | None = None,
+    cache_dir: str | None = None,
 ) -> str:
     expanded_path = Path(path).expanduser()
     if expanded_path.exists() and expanded_path.is_dir():
@@ -63,34 +54,29 @@ def ensure_local_emu35_weights(
             )
         return str(expanded_path.resolve())
 
-    cache_dir = (
-        Path(cache_base_dir).expanduser()
-        if cache_base_dir
-        else get_default_apertus_cache_dir()
-    )
-    repo_cache_path = cache_dir / hf_repo_id
-    if repo_cache_path.is_dir() and has_required_files(
-        repo_cache_path, required_files
-    ):
-        return str(repo_cache_path.resolve())
+    import huggingface_hub
 
-    from huggingface_hub import snapshot_download
-
-    logger.info("Downloading %s to %s", hf_repo_id, repo_cache_path)
-    repo_cache_path.parent.mkdir(parents=True, exist_ok=True)
-    snapshot_download(
+    local_only = huggingface_hub.constants.HF_HUB_OFFLINE
+    if local_only:
+        logger.info(
+            "Using cached weights for %s (cache_dir=%s)", hf_repo_id, cache_dir)
+    else:
+        logger.info("Downloading %s (cache_dir=%s)", hf_repo_id, cache_dir)
+    hf_folder = huggingface_hub.snapshot_download(
         repo_id=hf_repo_id,
-        local_dir=str(repo_cache_path),
         allow_patterns=list(required_files),
+        cache_dir=cache_dir,
+        local_files_only=local_only,
     )
 
-    if not has_required_files(repo_cache_path, required_files):
+    resolved = Path(hf_folder)
+    if not has_required_files(resolved, required_files):
         raise RuntimeError(
-            f"Resolved checkpoint at {repo_cache_path} is missing required "
+            f"Resolved checkpoint at {resolved} is missing required "
             f"files: {list(required_files)}."
         )
 
-    return str(repo_cache_path.resolve())
+    return str(resolved.resolve())
 
 
 def resolve_emu35_codebase(mm_processor_kwargs: Mapping[str, object]) -> Path:
@@ -173,14 +159,14 @@ def build_emu35_vision_tokenizer(
     default_repo: str,
     device: str,
     vq_type: str = "ibq",
-    cache_base_dir: str | None = None,
+    cache_dir: str | None = None,
     **kwargs: Any,
 ) -> Any:
     local_vq_path = ensure_local_emu35_weights(
         vq_hub,
         default_repo,
         required_files=_EMU35_VQ_REQUIRED_FILES,
-        cache_base_dir=cache_base_dir,
+        cache_dir=cache_dir,
     )
     build_vision_tokenizer = load_emu35_build_vision_tokenizer(str(emu35_codebase))
     return build_vision_tokenizer(
@@ -469,7 +455,7 @@ class ApertusImageTokenizer:
             "dtype": vision_dtype,
             "trust_remote_code": trust_remote_code,
         }
-        cache_base_dir = mm_processor_kwargs.get("apertus_vq_cache_dir")
+        cache_dir = mm_processor_kwargs.get("apertus_vq_cache_dir")
         logger.info(
             "[Apertus MM] loading Emu3.5 vision tokenizer from %r on device=%r",
             str(emu35_codebase),
@@ -481,8 +467,8 @@ class ApertusImageTokenizer:
             default_repo=self.DEFAULT_VQ_HUB,
             device=vision_device,
             vq_type=vq_type,
-            cache_base_dir=cache_base_dir
-            if isinstance(cache_base_dir, str)
+            cache_dir=cache_dir
+            if isinstance(cache_dir, str)
             else None,
             **kwargs,
         )
