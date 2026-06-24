@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+import types
+
 import numpy as np
 import pytest
 import torch
@@ -13,7 +16,7 @@ from vllm.model_executor.models.apertus import (
 from vllm.model_executor.models.apertus_utils import (
     ApertusAudioTokenizer,
     ApertusImageTokenizer,
-    resolve_apertus_audio_tokenizer_codebase,
+    load_wavtokenizer40_class,
     resolve_emu35_codebase,
 )
 from vllm.multimodal.media import MediaWithBytes
@@ -540,46 +543,64 @@ def test_apertus_vision_tokenizer_device_resolution_priority(monkeypatch):
     assert source == "mm_processor_kwargs"
 
 
-def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
-    paths = [
-        tmp_path
-        / "src"
-        / "audio_tokenizers"
-        / "implementations"
-        / "wavtokenizer.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-    ]
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(tmp_path))
+def test_apertus_audio_tokenizer_loads_from_installed_package():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
 
-    assert resolve_apertus_audio_tokenizer_codebase({}) == tmp_path
+    class FakeWavTokenizer40:
+        pass
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        assert load_wavtokenizer40_class() is FakeWavTokenizer40
+    load_wavtokenizer40_class.cache_clear()
 
 
-def test_apertus_audio_codebase_resolver_accepts_mm_processor_kwargs(
-    tmp_path, monkeypatch
-):
-    kwargs_path = tmp_path / "kwargs_codebase"
-    env_path = tmp_path / "env_codebase"
-    paths = [
-        kwargs_path
-        / "src"
-        / "audio_tokenizers"
-        / "implementations"
-        / "wavtokenizer.py",
-        kwargs_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        kwargs_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-        env_path / "src" / "audio_tokenizers" / "implementations" / "wavtokenizer.py",
-        env_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        env_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-    ]
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(env_path))
+def test_apertus_audio_tokenizer_only_honors_operational_kwargs():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: dict[str, object] = {}
 
-    assert resolve_apertus_audio_tokenizer_codebase(
-        {"apertus_audio_tokenizer_codebase": str(kwargs_path)}
-    ) == kwargs_path
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.update(kwargs)
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        audio_tokenizer = ApertusAudioTokenizer().get_audio_tokenizer(
+            {
+                "apertus_audio_tokenizer_type": "other",
+                "apertus_audio_tokenizer_name": "OtherTokenizer",
+                "apertus_audio_tokenizer_compile": False,
+                "apertus_audio_tokenizer_device": "cpu",
+            }
+        )
+
+    assert isinstance(audio_tokenizer, FakeWavTokenizer40)
+    assert init_kwargs == {
+        "device": "cpu",
+        "torch_compile": False,
+    }
+    load_wavtokenizer40_class.cache_clear()
+
+
+def test_apertus_audio_tokenizer_uses_explicit_checkpoint_path():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: dict[str, object] = {}
+
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.update(kwargs)
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        ApertusAudioTokenizer().get_audio_tokenizer(
+            {"apertus_audio_tokenizer_path": "/tmp/wavtokenizer"}
+        )
+
+    assert init_kwargs["checkpoint"] == "/tmp/wavtokenizer"
+    load_wavtokenizer40_class.cache_clear()

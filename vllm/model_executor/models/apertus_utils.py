@@ -24,13 +24,7 @@ logger = init_logger(__name__)
 
 _EMU35_VISION_TOKENIZER_MODULE_PREFIX = "_vllm_apertus_emu35_vision_tokenizer"
 _EMU35_VQ_REQUIRED_FILES = ("config.yaml", "model.ckpt")
-_APERTUS_AUDIO_TOKENIZER_REQUIRED_FILES = (
-    "src/audio_tokenizers/implementations/wavtokenizer.py",
-    "src/repos/wavtokenizer/encoder/utils.py",
-    "src/repos/wavtokenizer/decoder/pretrained.py",
-)
 _APERTUS_EMU35_CODEBASE_ENV_VAR = "VLLM_APERTUS_EMU35_CODEBASE"
-_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR = "VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE"
 _APERTUS_VISION_TOKENIZER_DEVICE_ENV_VAR = "VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
 
 
@@ -582,63 +576,19 @@ class ApertusImageTokenizer:
         return image_prompts
 
 
-def resolve_apertus_audio_tokenizer_codebase(
-    mm_processor_kwargs: Mapping[str, object],
-) -> Path:
-    def _resolve_candidate(raw_value: str, *, source: str) -> Path:
-        candidate = Path(os.path.expandvars(raw_value.strip())).expanduser()
-        if has_required_files(candidate, _APERTUS_AUDIO_TOKENIZER_REQUIRED_FILES):
-            return candidate.resolve()
-        raise FileNotFoundError(
-            "Unable to locate a complete benchmark-audio-tokenizer checkout from "
-            f"{source}={candidate}."
-        )
-
-    configured_codebase = mm_processor_kwargs.get("apertus_audio_tokenizer_codebase")
-    if isinstance(configured_codebase, str) and configured_codebase.strip():
-        return _resolve_candidate(
-            configured_codebase,
-            source="apertus_audio_tokenizer_codebase",
-        )
-
-    env_value = os.getenv(_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR)
-    if not env_value or not env_value.strip():
-        raise FileNotFoundError(
-            "Unable to locate a complete benchmark-audio-tokenizer checkout "
-            "for Apertus audio tokenization. Set "
-            f"{_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR}."
-        )
-
-    return _resolve_candidate(
-        env_value,
-        source=_APERTUS_AUDIO_TOKENIZER_CODEBASE_ENV_VAR,
-    )
-
-
 @lru_cache(maxsize=4)
-def load_wavtokenizer40_class(audio_codebase: str) -> Any:
-    codebase = Path(audio_codebase).resolve()
-    if str(codebase) not in sys.path:
-        sys.path.insert(0, str(codebase))
-
-    module = importlib.import_module(
-        "src.audio_tokenizers.implementations.wavtokenizer"
-    )
+def load_wavtokenizer40_class() -> Any:
+    module = importlib.import_module("apertus_audio_tokenizer")
     wavtokenizer_cls = getattr(module, "WavTokenizer40", None)
     if wavtokenizer_cls is None:
         raise AttributeError(
-            "benchmark-audio-tokenizer codebase does not expose WavTokenizer40."
+            "apertus-audio-tokenizer does not expose WavTokenizer40."
         )
     return wavtokenizer_cls
 
 
 class ApertusAudioTokenizer:
     DEFAULT_AUDIO_PLACEHOLDER = "<|audio|>"
-    DEFAULT_AUDIO_TOKENIZER_PATH = (
-        "/capstor/store/cscs/swissai/infra01/MLLM/wavtokenizer"
-    )
-    DEFAULT_AUDIO_TOKENIZER_TYPE = "wavtokenizer"
-    DEFAULT_AUDIO_TOKENIZER_NAME = "WavTokenizer40"
     DEFAULT_AUDIO_TOKENIZER_DEVICE = "cuda"
     DEFAULT_TARGET_SAMPLING_RATE = 24000
     DEFAULT_TARGET_PEAK_DBFS = -3.0
@@ -647,27 +597,7 @@ class ApertusAudioTokenizer:
     DEFAULT_AUDIO_END_TOKEN = "<|audio_end|>"
 
     def __init__(self) -> None:
-        self._audio_tokenizer_cache: dict[
-            tuple[str, str, bool, str, str, str], Any
-        ] = {}
-
-    @staticmethod
-    def coerce_int(value: object, *, default: int) -> int:
-        if value is None:
-            return default
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    @staticmethod
-    def coerce_float(value: object, *, default: float) -> float:
-        if value is None:
-            return default
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return default
+        self._audio_tokenizer_cache: dict[tuple[str | None, str, bool], Any] = {}
 
     @staticmethod
     def coerce_bool(value: object, *, default: bool) -> bool:
@@ -684,17 +614,6 @@ class ApertusAudioTokenizer:
             if lowered in {"0", "false", "f", "no", "n", "off"}:
                 return False
         return default
-
-    @staticmethod
-    def dedupe(items: Sequence[str]) -> list[str]:
-        seen: set[str] = set()
-        deduped: list[str] = []
-        for item in items:
-            if not item or item in seen:
-                continue
-            seen.add(item)
-            deduped.append(item)
-        return deduped
 
     @staticmethod
     def coerce_audio_waveform(audio_obj: object) -> np.ndarray:
@@ -772,24 +691,9 @@ class ApertusAudioTokenizer:
         self,
         mm_processor_kwargs: Mapping[str, object],
     ) -> Any:
-        tokenizer_path = str(
-            mm_processor_kwargs.get(
-                "apertus_audio_tokenizer_path",
-                self.DEFAULT_AUDIO_TOKENIZER_PATH,
-            )
-        )
-        tokenizer_type = str(
-            mm_processor_kwargs.get(
-                "apertus_audio_tokenizer_type",
-                self.DEFAULT_AUDIO_TOKENIZER_TYPE,
-            )
-        ).lower()
-        tokenizer_name = str(
-            mm_processor_kwargs.get(
-                "apertus_audio_tokenizer_name",
-                self.DEFAULT_AUDIO_TOKENIZER_NAME,
-            )
-        )
+        tokenizer_path = mm_processor_kwargs.get("apertus_audio_tokenizer_path")
+        if tokenizer_path is not None:
+            tokenizer_path = str(tokenizer_path)
         tokenizer_device = str(
             mm_processor_kwargs.get(
                 "apertus_audio_tokenizer_device",
@@ -798,29 +702,14 @@ class ApertusAudioTokenizer:
         )
         tokenizer_compile = self.coerce_bool(
             mm_processor_kwargs.get("apertus_audio_tokenizer_compile"),
-            default=False,
+            default=True,
         )
 
-        audio_codebase = resolve_apertus_audio_tokenizer_codebase(mm_processor_kwargs)
-        cache_key = (
-            tokenizer_path,
-            tokenizer_device,
-            tokenizer_compile,
-            tokenizer_type,
-            tokenizer_name,
-            str(audio_codebase),
-        )
+        cache_key = (tokenizer_path, tokenizer_device, tokenizer_compile)
         if cache_key in self._audio_tokenizer_cache:
             return self._audio_tokenizer_cache[cache_key]
 
-        if tokenizer_type != "wavtokenizer" or tokenizer_name != "WavTokenizer40":
-            raise ValueError(
-                "Apertus audio adapter currently supports only "
-                "audio_tokenizer_type=wavtokenizer and "
-                "audio_tokenizer_name=WavTokenizer40."
-            )
-
-        wavtokenizer_cls = load_wavtokenizer40_class(str(audio_codebase))
+        wavtokenizer_cls = load_wavtokenizer40_class()
         kwargs: dict[str, object] = {
             "device": tokenizer_device,
             "torch_compile": tokenizer_compile,
@@ -831,22 +720,6 @@ class ApertusAudioTokenizer:
         audio_tokenizer = wavtokenizer_cls(**kwargs)
         self._audio_tokenizer_cache[cache_key] = audio_tokenizer
         return audio_tokenizer
-
-    def placeholder_aliases(
-        self,
-        mm_processor_kwargs: Mapping[str, object],
-    ) -> list[str]:
-        configured_placeholder = mm_processor_kwargs.get("apertus_audio_placeholder")
-        return self.dedupe(
-            [
-                (
-                    configured_placeholder
-                    if isinstance(configured_placeholder, str)
-                    else ""
-                ),
-                self.DEFAULT_AUDIO_PLACEHOLDER,
-            ]
-        )
 
     def serialize_audio_token_ids(
         self,
@@ -874,15 +747,6 @@ class ApertusAudioTokenizer:
         if not audios:
             return []
 
-        token_offset = self.coerce_int(
-            mm_processor_kwargs.get("apertus_audio_token_offset"),
-            default=self.DEFAULT_AUDIO_TOKEN_OFFSET,
-        )
-        target_peak_dbfs = self.coerce_float(
-            mm_processor_kwargs.get("apertus_audio_target_peak_dbfs"),
-            default=self.DEFAULT_TARGET_PEAK_DBFS,
-        )
-
         audio_tokenizer = self.get_audio_tokenizer(mm_processor_kwargs)
         audio_device = self.resolve_torch_device(audio_tokenizer)
         audio_start_id = self.load_special_token_id(
@@ -899,7 +763,7 @@ class ApertusAudioTokenizer:
 
             # Match benchmark script default: peak-normalize to target dBFS.
             peak = audio_tensor.abs().max().clamp(min=1e-10)
-            target_peak = 10 ** (target_peak_dbfs / 20.0)
+            target_peak = 10 ** (self.DEFAULT_TARGET_PEAK_DBFS / 20.0)
             audio_tensor = audio_tensor * (target_peak / peak)
 
             audio_tensor = audio_tensor.to(audio_device)
@@ -910,7 +774,8 @@ class ApertusAudioTokenizer:
                 audio_codes = audio_codes.squeeze(0)
 
             shifted_codes = (
-                audio_codes.detach().to("cpu", dtype=torch.int64) + token_offset
+                audio_codes.detach().to("cpu", dtype=torch.int64)
+                + self.DEFAULT_AUDIO_TOKEN_OFFSET
             )
             prompt_ids = [audio_start_id]
             prompt_ids.extend(shifted_codes.tolist())

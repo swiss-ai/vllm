@@ -37,6 +37,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import XIELU
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -81,7 +82,6 @@ from vllm.multimodal.processing import (
 )
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
-from vllm.logger import init_logger
 
 from .apertus_utils import ApertusAudioTokenizer, ApertusImageTokenizer
 from .interfaces import (
@@ -282,9 +282,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             merged_mm_processor_kwargs,
         )
         image_placeholders = self._find_placeholders(prompt_text, image_aliases)
-        audio_aliases = self.audio_tokenizer.placeholder_aliases(
-            merged_mm_processor_kwargs
-        )
+        audio_aliases = [ApertusAudioTokenizer.DEFAULT_AUDIO_PLACEHOLDER]
         audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
 
         if image_placeholders and num_images == 0:
