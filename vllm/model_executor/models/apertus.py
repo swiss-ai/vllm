@@ -25,9 +25,13 @@
 # limitations under the License.
 """Inference-only Apertus model compatible with HuggingFace weights."""
 
+import importlib
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from itertools import islice
+from typing import Any
 
+import numpy as np
 import torch
 from torch import nn
 from transformers import ApertusConfig, BatchFeature
@@ -81,9 +85,10 @@ from vllm.multimodal.processing import (
     TimingContext,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.attention.backend import AttentionType
 
-from .apertus_utils import ApertusAudioTokenizer, ApertusImageTokenizer
+from .apertus_utils import ApertusImageTokenizer
 from .interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -104,6 +109,145 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@lru_cache(maxsize=4)
+def load_wavtokenizer40_class() -> Any:
+    module = importlib.import_module("apertus_audio_tokenizer")
+    wavtokenizer_cls = getattr(module, "WavTokenizer40", None)
+    if wavtokenizer_cls is None:
+        raise AttributeError(
+            "apertus-audio-tokenizer does not expose WavTokenizer40."
+        )
+    return wavtokenizer_cls
+
+
+class ApertusAudioTokenizer:
+    DEFAULT_AUDIO_PLACEHOLDER = "<|audio|>"
+    DEFAULT_AUDIO_TOKENIZER_DEVICE = "cuda"
+    DEFAULT_TARGET_SAMPLING_RATE = 24000
+    DEFAULT_TARGET_PEAK_DBFS = -3.0
+    DEFAULT_AUDIO_TOKEN_OFFSET = 262344
+    DEFAULT_AUDIO_START_TOKEN = "<|audio_start|>"
+    DEFAULT_AUDIO_END_TOKEN = "<|audio_end|>"
+
+    def __init__(self) -> None:
+        self._audio_tokenizer_cache: dict[tuple[str | None, str, bool], Any] = {}
+
+    @staticmethod
+    def coerce_bool(value: object, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        return default
+
+    @staticmethod
+    def to_audio_tensor(audio: np.ndarray) -> torch.Tensor:
+        if audio.ndim == 0:
+            raise ValueError("Audio waveform must have at least one dimension.")
+
+        audio_tensor = torch.from_numpy(audio.astype(np.float32, copy=False))
+        if audio_tensor.dim() == 1:
+            return audio_tensor.unsqueeze(0)
+        return audio_tensor
+
+    def load_special_token_id(self, tokenizer: TokenizerLike, token_str: str) -> int:
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is None or token_id == unk_token_id:
+            raise ValueError(f"Token {token_str} not found in tokenizer vocabulary.")
+        return int(token_id)
+
+    def get_audio_tokenizer(
+        self,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> Any:
+        tokenizer_path = mm_processor_kwargs.get("apertus_audio_tokenizer_path")
+        if tokenizer_path is not None:
+            tokenizer_path = str(tokenizer_path)
+        tokenizer_device = str(
+            mm_processor_kwargs.get(
+                "apertus_audio_tokenizer_device",
+                self.DEFAULT_AUDIO_TOKENIZER_DEVICE,
+            )
+        )
+        tokenizer_compile = self.coerce_bool(
+            mm_processor_kwargs.get("apertus_audio_tokenizer_compile"),
+            default=True,
+        )
+
+        cache_key = (tokenizer_path, tokenizer_device, tokenizer_compile)
+        if cache_key in self._audio_tokenizer_cache:
+            return self._audio_tokenizer_cache[cache_key]
+
+        wavtokenizer_cls = load_wavtokenizer40_class()
+        kwargs: dict[str, object] = {
+            "device": tokenizer_device,
+            "torch_compile": tokenizer_compile,
+        }
+        if tokenizer_path:
+            kwargs["checkpoint"] = tokenizer_path
+
+        audio_tokenizer = wavtokenizer_cls(**kwargs)
+        self._audio_tokenizer_cache[cache_key] = audio_tokenizer
+        return audio_tokenizer
+
+    def serialize_audio_token_ids(
+        self,
+        token_ids: Sequence[int],
+        tokenizer: TokenizerLike,
+    ) -> str:
+        token_strs = tokenizer.convert_ids_to_tokens(list(token_ids))
+        if isinstance(token_strs, str):
+            token_strs = [token_strs]
+        return "".join(str(token_str) for token_str in token_strs)
+
+    def encode_audios(
+        self,
+        audios: Sequence[np.ndarray],
+        *,
+        tokenizer: TokenizerLike,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> list[str]:
+        if not audios:
+            return []
+
+        audio_tokenizer = self.get_audio_tokenizer(mm_processor_kwargs)
+        audio_start_id = self.load_special_token_id(
+            tokenizer, self.DEFAULT_AUDIO_START_TOKEN
+        )
+        audio_end_id = self.load_special_token_id(
+            tokenizer, self.DEFAULT_AUDIO_END_TOKEN
+        )
+
+        serialized_prompts: list[str] = []
+        for raw_audio in audios:
+            audio_tensor = self.to_audio_tensor(raw_audio)
+
+            # Match benchmark script default: peak-normalize to target dBFS.
+            peak = audio_tensor.abs().max().clamp(min=1e-10)
+            target_peak = 10 ** (self.DEFAULT_TARGET_PEAK_DBFS / 20.0)
+            audio_tensor = audio_tensor * (target_peak / peak)
+
+            with torch.no_grad():
+                audio_codes = audio_tokenizer.encode_audio(audio_tensor)
+
+            if audio_codes.dim() == 2:
+                audio_codes = audio_codes.squeeze(0)
+
+            shifted_codes = (
+                audio_codes.detach().to("cpu", dtype=torch.int64)
+                + self.DEFAULT_AUDIO_TOKEN_OFFSET
+            )
+            prompt_ids = [audio_start_id] + shifted_codes.tolist() + [audio_end_id]
+
+            serialized_prompts.append(
+                self.serialize_audio_token_ids(
+                    prompt_ids,
+                    tokenizer,
+                )
+            )
+
+        return serialized_prompts
 
 
 class ApertusProcessingInfo(BaseProcessingInfo):
