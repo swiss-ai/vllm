@@ -46,7 +46,6 @@ DEFAULT_TOKENIZER = (
     "/capstor/store/cscs/swissai/infra01/MLLM/tokenizer/"
     "apertus_emu3.5_instruct"
 )
-DEFAULT_AUDIO_TOKENIZER_PATH = "/capstor/store/cscs/swissai/infra01/MLLM/wavtokenizer"
 IMAGE_PLACEHOLDER = "<|image|>"
 AUDIO_PLACEHOLDER = "<|audio|>"
 
@@ -87,15 +86,12 @@ def parse_args():
         ),
     )
     parser.add_argument("--vq-hub", default="BAAI/Emu3.5-VisionTokenizer")
-    parser.add_argument("--audio-tokenizer-path", default=DEFAULT_AUDIO_TOKENIZER_PATH)
-    parser.add_argument("--audio-tokenizer-device", default="cuda")
     parser.add_argument(
-        "--audio-tokenizer-codebase",
+        "--audio-tokenizer-path",
         default=None,
-        help="Path to benchmark-audio-tokenizer checkout.",
+        help="Optional local WavTokenizer checkpoint path.",
     )
-    parser.add_argument("--audio-target-sampling-rate", type=int, default=24000)
-    parser.add_argument("--audio-token-offset", type=int, default=262344)
+    parser.add_argument("--audio-tokenizer-device", default="cuda")
     parser.add_argument(
         "--expect-substring",
         default=None,
@@ -108,15 +104,12 @@ def build_mm_processor_kwargs(args) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "apertus_vision_tokenizer_device": args.vision_tokenizer_device,
         "apertus_vq_hub": args.vq_hub,
-        "apertus_audio_tokenizer_path": args.audio_tokenizer_path,
         "apertus_audio_tokenizer_device": args.audio_tokenizer_device,
-        "apertus_audio_target_sampling_rate": args.audio_target_sampling_rate,
-        "apertus_audio_token_offset": args.audio_token_offset,
     }
     if args.emu35_codebase:
         kwargs["apertus_emu35_codebase"] = args.emu35_codebase
-    if args.audio_tokenizer_codebase:
-        kwargs["apertus_audio_tokenizer_codebase"] = args.audio_tokenizer_codebase
+    if args.audio_tokenizer_path:
+        kwargs["apertus_audio_tokenizer_path"] = args.audio_tokenizer_path
     return kwargs
 
 

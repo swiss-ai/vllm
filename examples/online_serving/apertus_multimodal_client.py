@@ -13,8 +13,7 @@ Launch a server first, for example:
       --tensor-parallel-size 4 \
       --limit-mm-per-prompt '{"image": 1, "audio": 1}' \
       --mm-processor-kwargs '{
-        "apertus_vision_tokenizer_device": "cuda",
-        "apertus_audio_tokenizer_path": "/capstor/.../wavtokenizer"
+        "apertus_vision_tokenizer_device": "cuda"
       }'
 
 Then run:
