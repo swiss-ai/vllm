@@ -10,13 +10,13 @@ import torch
 from PIL import Image
 
 from vllm.model_executor.models.apertus import (
+    ApertusAudioTokenizer,
     ApertusForCausalLM,
     ApertusMultiModalProcessor,
+    load_wavtokenizer40_class,
 )
 from vllm.model_executor.models.apertus_utils import (
-    ApertusAudioTokenizer,
     ApertusImageTokenizer,
-    load_wavtokenizer40_class,
     resolve_emu35_codebase,
 )
 from vllm.multimodal.media import MediaWithBytes
