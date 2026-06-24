@@ -601,90 +601,25 @@ class ApertusAudioTokenizer:
 
     @staticmethod
     def coerce_bool(value: object, *, default: bool) -> bool:
-        if value is None:
-            return default
         if isinstance(value, bool):
             return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            lowered = value.strip().lower()
-            if lowered in {"1", "true", "t", "yes", "y", "on"}:
-                return True
-            if lowered in {"0", "false", "f", "no", "n", "off"}:
-                return False
         return default
 
     @staticmethod
-    def coerce_audio_waveform(audio_obj: object) -> np.ndarray:
-        if isinstance(audio_obj, np.ndarray):
-            audio = audio_obj
-        elif torch.is_tensor(audio_obj):
-            audio = audio_obj.detach().cpu().numpy()
-        elif isinstance(audio_obj, list):
-            audio = np.asarray(audio_obj)
-        else:
-            raise TypeError(f"Unsupported audio waveform type: {type(audio_obj)}")
-
+    def to_audio_tensor(audio: np.ndarray) -> torch.Tensor:
         if audio.ndim == 0:
             raise ValueError("Audio waveform must have at least one dimension.")
 
-        return np.asarray(audio, dtype=np.float32)
-
-    def normalize_audio_input(
-        self,
-        item: object,
-    ) -> np.ndarray:
-        if isinstance(item, tuple) and len(item) == 2:
-            return self.coerce_audio_waveform(item[0])
-
-        if isinstance(item, Mapping):
-            if "array" in item:
-                return self.coerce_audio_waveform(item["array"])
-            if "audio_array" in item:
-                return self.coerce_audio_waveform(item["audio_array"])
-
-            raise TypeError(
-                "Unsupported mapping keys for Apertus audio input. "
-                f"Got keys: {sorted(item.keys())}"
-            )
-
-        return self.coerce_audio_waveform(item)
-
-    @staticmethod
-    def to_audio_tensor(waveform: np.ndarray) -> torch.Tensor:
-        audio_tensor = torch.from_numpy(waveform).float()
+        audio_tensor = torch.from_numpy(audio.astype(np.float32, copy=False))
         if audio_tensor.dim() == 1:
             return audio_tensor.unsqueeze(0)
         return audio_tensor
 
-    @staticmethod
-    def resolve_torch_device(tokenizer: object) -> torch.device:
-        if not hasattr(tokenizer, "parameters"):
-            return torch.device("cpu")
-
-        try:
-            return next(tokenizer.parameters()).device
-        except Exception:
-            configured = getattr(tokenizer, "device", None)
-            if configured is not None:
-                return torch.device(configured)
-
-        return torch.device("cpu")
-
     def load_special_token_id(self, tokenizer: TokenizerLike, token_str: str) -> int:
-        convert = getattr(tokenizer, "convert_tokens_to_ids", None)
-        if not callable(convert):
-            raise AttributeError(
-                "Tokenizer must expose convert_tokens_to_ids for Apertus audio prompts."
-            )
-
-        token_id = convert(token_str)
-        unk_token_id = getattr(tokenizer, "unk_token_id", 1000)
-        if token_id is None or (unk_token_id is not None and token_id == unk_token_id):
-            token_id = 1000
-            # raise ValueError(f"Token {token_str} not found in tokenizer vocabulary.")
-
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is None or token_id == unk_token_id:
+            raise ValueError(f"Token {token_str} not found in tokenizer vocabulary.")
         return int(token_id)
 
     def get_audio_tokenizer(
@@ -726,20 +661,14 @@ class ApertusAudioTokenizer:
         token_ids: Sequence[int],
         tokenizer: TokenizerLike,
     ) -> str:
-        convert_ids_to_tokens = getattr(tokenizer, "convert_ids_to_tokens", None)
-        if callable(convert_ids_to_tokens):
-            token_strs = convert_ids_to_tokens(list(token_ids))
-            if isinstance(token_strs, str):
-                token_strs = [token_strs]
-            serialized = "".join(str(token_str) for token_str in token_strs)
-        else:
-            serialized = tokenizer.decode(list(token_ids), skip_special_tokens=False)
-
-        return serialized
+        token_strs = tokenizer.convert_ids_to_tokens(list(token_ids))
+        if isinstance(token_strs, str):
+            token_strs = [token_strs]
+        return "".join(str(token_str) for token_str in token_strs)
 
     def encode_audios(
         self,
-        audios: Sequence[object],
+        audios: Sequence[np.ndarray],
         *,
         tokenizer: TokenizerLike,
         mm_processor_kwargs: Mapping[str, object],
@@ -748,7 +677,6 @@ class ApertusAudioTokenizer:
             return []
 
         audio_tokenizer = self.get_audio_tokenizer(mm_processor_kwargs)
-        audio_device = self.resolve_torch_device(audio_tokenizer)
         audio_start_id = self.load_special_token_id(
             tokenizer, self.DEFAULT_AUDIO_START_TOKEN
         )
@@ -758,15 +686,13 @@ class ApertusAudioTokenizer:
 
         serialized_prompts: list[str] = []
         for raw_audio in audios:
-            waveform = self.normalize_audio_input(raw_audio)
-            audio_tensor = self.to_audio_tensor(waveform)
+            audio_tensor = self.to_audio_tensor(raw_audio)
 
             # Match benchmark script default: peak-normalize to target dBFS.
             peak = audio_tensor.abs().max().clamp(min=1e-10)
             target_peak = 10 ** (self.DEFAULT_TARGET_PEAK_DBFS / 20.0)
             audio_tensor = audio_tensor * (target_peak / peak)
 
-            audio_tensor = audio_tensor.to(audio_device)
             with torch.no_grad():
                 audio_codes = audio_tokenizer.encode_audio(audio_tensor)
 
@@ -777,9 +703,7 @@ class ApertusAudioTokenizer:
                 audio_codes.detach().to("cpu", dtype=torch.int64)
                 + self.DEFAULT_AUDIO_TOKEN_OFFSET
             )
-            prompt_ids = [audio_start_id]
-            prompt_ids.extend(shifted_codes.tolist())
-            prompt_ids.append(audio_end_id)
+            prompt_ids = [audio_start_id] + shifted_codes.tolist() + [audio_end_id]
 
             serialized_prompts.append(
                 self.serialize_audio_token_ids(

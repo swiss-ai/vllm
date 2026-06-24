@@ -173,11 +173,13 @@ def run_processor(
     prompt: str,
     num_images: int = 0,
     num_audios: int = 0,
+    mm_processor_kwargs: dict[str, object] | None = None,
 ):
     return processor.apply(
         ProcessorInputs(
             prompt=prompt,
             mm_data_items=parse_mm_inputs(num_images=num_images, num_audios=num_audios),
+            hf_processor_mm_kwargs=mm_processor_kwargs or {},
         ),
         TimingContext(enabled=False),
     )
@@ -584,6 +586,75 @@ def test_apertus_audio_tokenizer_only_honors_operational_kwargs():
         "torch_compile": False,
     }
     load_wavtokenizer40_class.cache_clear()
+
+
+def test_apertus_audio_tokenizer_cache_is_keyed_by_device():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: list[dict[str, object]] = []
+
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.append(dict(kwargs))
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        apertus_audio_tokenizer = ApertusAudioTokenizer()
+
+        cpu_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cpu"}
+        )
+        cuda0_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cuda:0"}
+        )
+        cached_cpu_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cpu"}
+        )
+
+    assert cpu_tokenizer is cached_cpu_tokenizer
+    assert cpu_tokenizer is not cuda0_tokenizer
+    assert init_kwargs == [
+        {
+            "device": "cpu",
+            "torch_compile": True,
+        },
+        {
+            "device": "cuda:0",
+            "torch_compile": True,
+        },
+    ]
+    load_wavtokenizer40_class.cache_clear()
+
+
+def test_apertus_processor_forwards_audio_mm_processor_kwargs():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+    captured_kwargs: dict[str, object] = {}
+
+    def encode_audios(audios, **kwargs):  # type: ignore[no-untyped-def]
+        del audios
+        captured_kwargs.update(kwargs["mm_processor_kwargs"])
+        return ["<AUD0>"]
+
+    processor.audio_tokenizer.encode_audios = encode_audios  # type: ignore[method-assign]
+
+    result = run_processor(
+        processor,
+        prompt="A<|audio|>B",
+        num_audios=1,
+        mm_processor_kwargs={
+            "apertus_audio_tokenizer_device": "cuda:1",
+            "apertus_audio_tokenizer_compile": False,
+        },
+    )
+
+    assert result["prompt"] == "A<AUD0>B"
+    assert captured_kwargs == {
+        "apertus_audio_tokenizer_device": "cuda:1",
+        "apertus_audio_tokenizer_compile": False,
+    }
 
 
 def test_apertus_audio_tokenizer_uses_explicit_checkpoint_path():
