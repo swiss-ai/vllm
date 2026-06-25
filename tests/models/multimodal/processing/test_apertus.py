@@ -12,12 +12,10 @@ from PIL import Image
 from vllm.model_executor.models.apertus import (
     ApertusAudioTokenizer,
     ApertusForCausalLM,
-    ApertusMultiModalProcessor,
-    load_wavtokenizer40_class,
-)
-from vllm.model_executor.models.apertus_utils import (
     ApertusImageTokenizer,
+    ApertusMultiModalProcessor,
     load_emu35_build_vision_tokenizer,
+    load_wavtokenizer40_class,
 )
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import ProcessorInputs, TimingContext
@@ -512,7 +510,7 @@ def test_apertus_vision_tokenizer_device_comes_from_mm_kwargs(monkeypatch):
         return FakeVisionTokenizer()
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.apertus_utils.build_emu35_vision_tokenizer",
+        "vllm.model_executor.models.apertus.build_emu35_vision_tokenizer",
         fake_build_emu35_vision_tokenizer,
     )
 
@@ -538,7 +536,7 @@ def test_apertus_vision_tokenizer_cpu_uses_default_dtype(monkeypatch):
         return FakeVisionTokenizer()
 
     monkeypatch.setattr(
-        "vllm.model_executor.models.apertus_utils.build_emu35_vision_tokenizer",
+        "vllm.model_executor.models.apertus.build_emu35_vision_tokenizer",
         fake_build_emu35_vision_tokenizer,
     )
 
