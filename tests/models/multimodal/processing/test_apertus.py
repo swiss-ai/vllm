@@ -17,9 +17,8 @@ from vllm.model_executor.models.apertus import (
 )
 from vllm.model_executor.models.apertus_utils import (
     ApertusImageTokenizer,
-    resolve_emu35_codebase,
+    load_emu35_build_vision_tokenizer,
 )
-from vllm.multimodal.media import MediaWithBytes
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import ProcessorInputs, TimingContext
 
@@ -186,11 +185,10 @@ def run_processor(
 
 
 def test_apertus_image_prompt_serialization_uses_expected_tokens():
-    tokenizer = DummyTokenizer()
     image_tokenizer = ApertusImageTokenizer()
     image_tokens = torch.tensor([[1, 2], [3, 4]])
 
-    prompt = image_tokenizer.build_apertus_image_prompt(image_tokens, tokenizer)
+    prompt = image_tokenizer.build_apertus_image_prompt(image_tokens)
 
     assert prompt == (
         "<|img_start|>2*2<|img_token_start|>"
@@ -201,29 +199,18 @@ def test_apertus_image_prompt_serialization_uses_expected_tokens():
     )
 
 
-def test_apertus_image_prompt_honors_tokenizer_special_tokens():
-    class CustomTokenizer(DummyTokenizer):
-        boi_token = "<BOI>"
-        img_token = "<IMG>"
-        eol_token = "<EOL>"
-        eoi_token = "<EOI>"
-
-    prompt = ApertusImageTokenizer().build_apertus_image_prompt(
-        torch.tensor([[8, 9]]),
-        CustomTokenizer(),
+def test_apertus_extracts_emu35_ibq_token_grid():
+    token_ids = torch.arange(6)
+    encode_out = (
+        torch.empty(1, 256, 2, 3),
+        0.0,
+        (None, None, token_ids),
     )
 
-    assert prompt == "<BOI>1*2<IMG><|visual token 8|><|visual token 9|><EOI>"
+    grid = ApertusImageTokenizer.extract_emu35_token_grid(encode_out, 2, 3)
 
-
-def test_apertus_image_tokenizer_unwraps_media_with_bytes():
-    image = Image.new("RGB", (16, 16), color=(3, 4, 5))
-    wrapped = MediaWithBytes(image, b"raw-bytes")
-
-    coerced = ApertusImageTokenizer.coerce_pil_image(wrapped)
-
-    assert isinstance(coerced, Image.Image)
-    assert coerced.size == image.size
+    assert grid.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert grid.dtype is torch.int64
 
 
 def test_apertus_processor_text_only():
@@ -491,58 +478,78 @@ def test_apertus_model_placeholder_str():
 
 
 def test_apertus_image_placeholder_aliases_include_apertus_default():
-    tokenizer = DummyTokenizer()
-    tokenizer.image_token = "<image>"
-    aliases = ApertusImageTokenizer.placeholder_aliases(tokenizer, {})
+    aliases = ApertusImageTokenizer.placeholder_aliases()
 
-    assert aliases == ["<image>", "<|image|>"]
+    assert aliases == ["<|image|>"]
 
 
-def test_apertus_image_placeholder_aliases_allow_explicit_override():
-    tokenizer = DummyTokenizer()
-    aliases = ApertusImageTokenizer.placeholder_aliases(
-        tokenizer,
-        {"apertus_image_placeholder": "<custom-image-token>"},
+def test_apertus_emu35_vision_tokenizer_loads_from_installed_package(monkeypatch):
+    module = types.ModuleType("vision_tokenizer")
+
+    def build_vision_tokenizer(**kwargs):
+        return kwargs
+
+    module.build_vision_tokenizer = build_vision_tokenizer
+
+    load_emu35_build_vision_tokenizer.cache_clear()
+    try:
+        monkeypatch.setitem(sys.modules, "vision_tokenizer", module)
+
+        assert load_emu35_build_vision_tokenizer() is build_vision_tokenizer
+    finally:
+        load_emu35_build_vision_tokenizer.cache_clear()
+
+
+def test_apertus_vision_tokenizer_device_comes_from_mm_kwargs(monkeypatch):
+    tokenizer = ApertusImageTokenizer()
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeVisionTokenizer:
+        pass
+
+    def fake_build_emu35_vision_tokenizer(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeVisionTokenizer()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.apertus_utils.build_emu35_vision_tokenizer",
+        fake_build_emu35_vision_tokenizer,
     )
 
-    assert aliases == ["<custom-image-token>", "<|image|>"]
-
-
-def test_apertus_emu35_codebase_resolver_prefers_mm_kwargs(tmp_path):
-    module_dir = tmp_path / "src" / "vision_tokenizer"
-    module_dir.mkdir(parents=True)
-    (module_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    assert resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)}) == tmp_path
-
-
-def test_apertus_emu35_codebase_resolver_uses_env_var(tmp_path, monkeypatch):
-    module_dir = tmp_path / "src" / "vision_tokenizer"
-    module_dir.mkdir(parents=True)
-    (module_dir / "__init__.py").write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_EMU35_CODEBASE", str(tmp_path))
-
-    assert resolve_emu35_codebase({}) == tmp_path
-
-
-def test_apertus_vision_tokenizer_device_resolution_priority(monkeypatch):
-    tokenizer = ApertusImageTokenizer()
-
-    monkeypatch.delenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", raising=False)
-    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
-    assert device == "cuda"
-    assert source == "default"
-
-    monkeypatch.setenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", "cpu")
-    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
-    assert device == "cpu"
-    assert source == "env:VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
-
-    (device, source) = tokenizer._resolve_vision_tokenizer_device(
+    _, device, dtype = tokenizer.load_vision_tokenizer(
         {"apertus_vision_tokenizer_device": "cuda:1"}
     )
+
     assert device == "cuda:1"
-    assert source == "mm_processor_kwargs"
+    assert dtype is torch.float32
+    assert captured_kwargs["device"] == "cuda:1"
+    assert captured_kwargs["dtype"] is torch.float32
+
+
+def test_apertus_vision_tokenizer_cpu_uses_default_dtype(monkeypatch):
+    tokenizer = ApertusImageTokenizer()
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeVisionTokenizer:
+        pass
+
+    def fake_build_emu35_vision_tokenizer(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeVisionTokenizer()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.apertus_utils.build_emu35_vision_tokenizer",
+        fake_build_emu35_vision_tokenizer,
+    )
+
+    _, device, dtype = tokenizer.load_vision_tokenizer(
+        {"apertus_vision_tokenizer_device": "cpu"}
+    )
+
+    assert device == "cpu"
+    assert dtype is torch.float32
+    assert captured_kwargs["device"] == "cpu"
+    assert captured_kwargs["dtype"] is torch.float32
 
 
 def test_apertus_audio_tokenizer_loads_from_installed_package():

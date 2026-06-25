@@ -113,13 +113,18 @@ logger = init_logger(__name__)
 
 @lru_cache(maxsize=4)
 def load_wavtokenizer40_class() -> Any:
-    module = importlib.import_module("apertus_audio_tokenizer")
-    wavtokenizer_cls = getattr(module, "WavTokenizer40", None)
-    if wavtokenizer_cls is None:
-        raise AttributeError(
-            "apertus-audio-tokenizer does not expose WavTokenizer40."
-        )
-    return wavtokenizer_cls
+    try:
+        module = importlib.import_module("apertus_audio_tokenizer")
+    except ImportError as exc:
+        raise ImportError(
+            "Apertus audio preprocessing requires the apertus-audio-tokenizer "
+            "package to be installed. Install it with "
+            "`uv pip install git+https://github.com/swiss-ai/"
+            "apertus-audio-tokenizer.git` or install the package into the "
+            "vLLM environment."
+        ) from exc
+
+    return module.WavTokenizer40
 
 
 class ApertusAudioTokenizer:
@@ -421,10 +426,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
 
         num_images = inputs.mm_data_items.get_count("image", strict=False)
         num_audios = inputs.mm_data_items.get_count("audio", strict=False)
-        image_aliases = self.image_tokenizer.placeholder_aliases(
-            tokenizer,
-            merged_mm_processor_kwargs,
-        )
+        image_aliases = self.image_tokenizer.placeholder_aliases()
         image_placeholders = self._find_placeholders(prompt_text, image_aliases)
         audio_aliases = [ApertusAudioTokenizer.DEFAULT_AUDIO_PLACEHOLDER]
         audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
@@ -485,7 +487,6 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 images = image_items.get_all()
                 image_prompts = self.image_tokenizer.encode_images(
                     images,
-                    tokenizer=tokenizer,
                     mm_processor_kwargs=merged_mm_processor_kwargs,
                 )
 
