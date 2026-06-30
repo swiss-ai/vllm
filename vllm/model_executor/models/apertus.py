@@ -25,10 +25,16 @@
 # limitations under the License.
 """Inference-only Apertus model compatible with HuggingFace weights."""
 
+import importlib
 from collections.abc import Iterable, Mapping, Sequence
+from functools import lru_cache
 from itertools import islice
+from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
+from PIL import Image
 from torch import nn
 from transformers import ApertusConfig, BatchFeature
 
@@ -37,6 +43,7 @@ from vllm.config import CacheConfig, VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import XIELU
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -80,10 +87,9 @@ from vllm.multimodal.processing import (
     TimingContext,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.attention.backend import AttentionType
-from vllm.logger import init_logger
 
-from .apertus_utils import ApertusAudioTokenizer, ApertusImageTokenizer
 from .interfaces import (
     EagleModelMixin,
     MultiModalEmbeddings,
@@ -104,6 +110,360 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def resolve_emu35_weights(
+    hf_repo_id: str,
+    *,
+    cache_dir: str | None = None,
+) -> str:
+    import huggingface_hub
+
+    logger.info("Resolving %s from Hugging Face cache (cache_dir=%s)",
+                hf_repo_id, cache_dir)
+    hf_folder = huggingface_hub.snapshot_download(
+        repo_id=hf_repo_id,
+        allow_patterns=["config.yaml", "model.ckpt"],
+        cache_dir=cache_dir,
+    )
+    return str(Path(hf_folder).resolve())
+
+
+@lru_cache(maxsize=4)
+def load_emu35_build_vision_tokenizer() -> Any:
+    try:
+        from vision_tokenizer import build_vision_tokenizer
+    except ImportError as exc:
+        raise ImportError(
+            "Apertus image preprocessing requires the Emu3.5 package to be "
+            "installed. Install it with "
+            "`uv pip install git+https://github.com/swiss-ai/Emu3.5.git` "
+            "or install the package into the vLLM environment."
+        ) from exc
+
+    return build_vision_tokenizer
+
+
+def build_emu35_vision_tokenizer(
+    *,
+    vq_hub: str,
+    device: str,
+    vq_type: str = "ibq",
+    cache_dir: str | None = None,
+    **kwargs: Any,
+) -> Any:
+    local_vq_path = resolve_emu35_weights(vq_hub, cache_dir=cache_dir)
+    build_vision_tokenizer = load_emu35_build_vision_tokenizer()
+    return build_vision_tokenizer(
+        type=vq_type,
+        model_path=local_vq_path,
+        device=device,
+        **kwargs,
+    ).eval()
+
+
+class ApertusImageTokenizer:
+    DEFAULT_VQ_HUB = "BAAI/Emu3.5-VisionTokenizer"
+    DEFAULT_MIN_PIXELS = 256 * 256
+    DEFAULT_MAX_PIXELS = 1400 * 1400
+    DEFAULT_IMAGE_PLACEHOLDER = "<|image|>"
+    VISUAL_TEMPLATE = "<|visual token {token_id}|>"
+    EMU35_DS_FACTOR = 16
+    DEFAULT_BOI_TOKEN = "<|img_start|>"
+    DEFAULT_IMG_TOKEN = "<|img_token_start|>"
+    DEFAULT_EOL_TOKEN = "<|img_end_of_row|>"
+    DEFAULT_EOI_TOKEN = "<|img_end|>"
+
+    def __init__(self) -> None:
+        self._vision_tokenizer_cache: dict[
+            tuple[str, str, str, torch.dtype],
+            tuple[Any, str, torch.dtype],
+        ] = {}
+
+    @staticmethod
+    def smart_resize(image: Image.Image, area: int, ds_factor: int) -> Image.Image:
+        width, height = image.size
+        aspect_ratio = width / height
+        new_height = int((area / aspect_ratio) ** 0.5)
+        new_width = int(new_height * aspect_ratio)
+        new_height = ((new_height + ds_factor // 2) // ds_factor) * ds_factor
+        new_width = ((new_width + ds_factor // 2) // ds_factor) * ds_factor
+        return image.resize((new_width, new_height), Image.BICUBIC)
+
+    @staticmethod
+    def extract_emu35_token_grid(
+        encode_out: Any,
+        token_height: int,
+        token_width: int,
+    ) -> torch.Tensor:
+        token = encode_out[2][2]
+        expected = token_height * token_width
+        if token.numel() != expected:
+            raise ValueError(
+                "Apertus Emu3.5 token length mismatch: "
+                f"got {token.numel()}, expected {expected}."
+            )
+        return token.view(token_height, token_width).to(dtype=torch.int64)
+
+    @classmethod
+    def placeholder_aliases(cls) -> list[str]:
+        return [cls.DEFAULT_IMAGE_PLACEHOLDER]
+
+    def load_vision_tokenizer(
+        self,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> tuple[Any, str, torch.dtype]:
+        vq_hub = self.DEFAULT_VQ_HUB
+        vq_type = "ibq"
+        vision_device = str(
+            mm_processor_kwargs.get("apertus_vision_tokenizer_device", "cuda")
+        )
+        vision_dtype = torch.float32
+
+        cache_key = (
+            vq_hub,
+            vq_type,
+            vision_device,
+            vision_dtype,
+        )
+
+        if cache_key in self._vision_tokenizer_cache:
+            return self._vision_tokenizer_cache[cache_key]
+
+        cache_dir = mm_processor_kwargs.get("apertus_vq_cache_dir")
+        vision_tokenizer = build_emu35_vision_tokenizer(
+            vq_hub=vq_hub,
+            device=vision_device,
+            vq_type=vq_type,
+            cache_dir=cache_dir
+            if isinstance(cache_dir, str)
+            else None,
+            dtype=vision_dtype,
+        )
+
+        resolved = (vision_tokenizer, vision_device, vision_dtype)
+        self._vision_tokenizer_cache[cache_key] = resolved
+        return resolved
+
+    def build_apertus_image_prompt(
+        self,
+        image_tokens: torch.Tensor,
+    ) -> str:
+        if image_tokens.ndim != 2:
+            raise ValueError(
+                f"Apertus image tokens must be 2D, got "
+                f"shape {tuple(image_tokens.shape)}"
+            )
+
+        height, width = image_tokens.shape
+        rows = [
+            "".join(
+                self.VISUAL_TEMPLATE.format(token_id=int(token_id))
+                for token_id in row
+            )
+            for row in image_tokens.detach().to("cpu").tolist()
+        ]
+        imgstr = self.DEFAULT_EOL_TOKEN.join(rows)
+
+        return (
+            f"{self.DEFAULT_BOI_TOKEN}{height}*{width}"
+            f"{self.DEFAULT_IMG_TOKEN}{imgstr}{self.DEFAULT_EOI_TOKEN}"
+        )
+
+    def encode_images(
+        self,
+        images: Sequence[Image.Image],
+        *,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> list[str]:
+        if not images:
+            return []
+
+        vision_tokenizer, vision_device, vision_dtype = self.load_vision_tokenizer(
+            mm_processor_kwargs
+        )
+
+        image_prompts: list[str] = []
+        for image in images:
+            image = image.convert("RGB")
+            width, height = image.size
+            current_area = width * height
+            target_area = max(
+                min(self.DEFAULT_MAX_PIXELS, current_area),
+                self.DEFAULT_MIN_PIXELS,
+            )
+            resized_image = self.smart_resize(image, target_area, self.EMU35_DS_FACTOR)
+            resized_w, resized_h = resized_image.size
+
+            image_tensor = torch.tensor(
+                (np.array(resized_image) / 127.5 - 1.0),
+                device=vision_device,
+                dtype=vision_dtype,
+            ).permute(2, 0, 1)
+
+            with torch.inference_mode():
+                try:
+                    encode_out = vision_tokenizer.encode(image_tensor[None])
+                except TypeError:
+                    try:
+                        encode_out = vision_tokenizer.encode(
+                            pixel_values=image_tensor[None]
+                        )
+                    except TypeError:
+                        encode_out = vision_tokenizer.encode(images=image_tensor[None])
+
+            token_h = resized_h // self.EMU35_DS_FACTOR
+            token_w = resized_w // self.EMU35_DS_FACTOR
+            image_token_grid = self.extract_emu35_token_grid(
+                encode_out, token_h, token_w
+            )
+            image_prompts.append(self.build_apertus_image_prompt(image_token_grid))
+
+        return image_prompts
+
+
+@lru_cache(maxsize=4)
+def load_wavtokenizer40_class() -> Any:
+    try:
+        module = importlib.import_module("apertus_audio_tokenizer")
+    except ImportError as exc:
+        raise ImportError(
+            "Apertus audio preprocessing requires the apertus-audio-tokenizer "
+            "package to be installed. Install it with "
+            "`uv pip install git+https://github.com/swiss-ai/"
+            "apertus-audio-tokenizer.git` or install the package into the "
+            "vLLM environment."
+        ) from exc
+
+    return module.WavTokenizer40
+
+
+class ApertusAudioTokenizer:
+    DEFAULT_AUDIO_PLACEHOLDER = "<|audio|>"
+    DEFAULT_AUDIO_TOKENIZER_DEVICE = "cuda"
+    DEFAULT_TARGET_SAMPLING_RATE = 24000
+    DEFAULT_TARGET_PEAK_DBFS = -3.0
+    DEFAULT_AUDIO_TOKEN_OFFSET = 262344
+    DEFAULT_AUDIO_START_TOKEN = "<|audio_start|>"
+    DEFAULT_AUDIO_END_TOKEN = "<|audio_end|>"
+
+    def __init__(self) -> None:
+        self._audio_tokenizer_cache: dict[tuple[str | None, str, bool], Any] = {}
+
+    @staticmethod
+    def coerce_bool(value: object, *, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        return default
+
+    @staticmethod
+    def to_audio_tensor(audio: np.ndarray) -> torch.Tensor:
+        if audio.ndim == 0:
+            raise ValueError("Audio waveform must have at least one dimension.")
+
+        audio_tensor = torch.from_numpy(audio.astype(np.float32, copy=False))
+        if audio_tensor.dim() == 1:
+            return audio_tensor.unsqueeze(0)
+        return audio_tensor
+
+    def load_special_token_id(self, tokenizer: TokenizerLike, token_str: str) -> int:
+        token_id = tokenizer.convert_tokens_to_ids(token_str)
+        unk_token_id = getattr(tokenizer, "unk_token_id", None)
+        if token_id is None or token_id == unk_token_id:
+            raise ValueError(f"Token {token_str} not found in tokenizer vocabulary.")
+        return int(token_id)
+
+    def get_audio_tokenizer(
+        self,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> Any:
+        tokenizer_path = mm_processor_kwargs.get("apertus_audio_tokenizer_path")
+        if tokenizer_path is not None:
+            tokenizer_path = str(tokenizer_path)
+        tokenizer_device = str(
+            mm_processor_kwargs.get(
+                "apertus_audio_tokenizer_device",
+                self.DEFAULT_AUDIO_TOKENIZER_DEVICE,
+            )
+        )
+        tokenizer_compile = self.coerce_bool(
+            mm_processor_kwargs.get("apertus_audio_tokenizer_compile"),
+            default=True,
+        )
+
+        cache_key = (tokenizer_path, tokenizer_device, tokenizer_compile)
+        if cache_key in self._audio_tokenizer_cache:
+            return self._audio_tokenizer_cache[cache_key]
+
+        wavtokenizer_cls = load_wavtokenizer40_class()
+        kwargs: dict[str, object] = {
+            "device": tokenizer_device,
+            "torch_compile": tokenizer_compile,
+        }
+        if tokenizer_path:
+            kwargs["checkpoint"] = tokenizer_path
+
+        audio_tokenizer = wavtokenizer_cls(**kwargs)
+        self._audio_tokenizer_cache[cache_key] = audio_tokenizer
+        return audio_tokenizer
+
+    def serialize_audio_token_ids(
+        self,
+        token_ids: Sequence[int],
+        tokenizer: TokenizerLike,
+    ) -> str:
+        token_strs = tokenizer.convert_ids_to_tokens(list(token_ids))
+        if isinstance(token_strs, str):
+            token_strs = [token_strs]
+        return "".join(str(token_str) for token_str in token_strs)
+
+    def encode_audios(
+        self,
+        audios: Sequence[np.ndarray],
+        *,
+        tokenizer: TokenizerLike,
+        mm_processor_kwargs: Mapping[str, object],
+    ) -> list[str]:
+        if not audios:
+            return []
+
+        audio_tokenizer = self.get_audio_tokenizer(mm_processor_kwargs)
+        audio_start_id = self.load_special_token_id(
+            tokenizer, self.DEFAULT_AUDIO_START_TOKEN
+        )
+        audio_end_id = self.load_special_token_id(
+            tokenizer, self.DEFAULT_AUDIO_END_TOKEN
+        )
+
+        serialized_prompts: list[str] = []
+        for raw_audio in audios:
+            audio_tensor = self.to_audio_tensor(raw_audio)
+
+            # Match benchmark script default: peak-normalize to target dBFS.
+            peak = audio_tensor.abs().max().clamp(min=1e-10)
+            target_peak = 10 ** (self.DEFAULT_TARGET_PEAK_DBFS / 20.0)
+            audio_tensor = audio_tensor * (target_peak / peak)
+
+            with torch.no_grad():
+                audio_codes = audio_tokenizer.encode_audio(audio_tensor)
+
+            if audio_codes.dim() == 2:
+                audio_codes = audio_codes.squeeze(0)
+
+            shifted_codes = (
+                audio_codes.detach().to("cpu", dtype=torch.int64)
+                + self.DEFAULT_AUDIO_TOKEN_OFFSET
+            )
+            prompt_ids = [audio_start_id] + shifted_codes.tolist() + [audio_end_id]
+
+            serialized_prompts.append(
+                self.serialize_audio_token_ids(
+                    prompt_ids,
+                    tokenizer,
+                )
+            )
+
+        return serialized_prompts
 
 
 class ApertusProcessingInfo(BaseProcessingInfo):
@@ -258,6 +618,139 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         token_ids = tokenizer.encode(text, **dict(tokenization_kwargs))
         return list(token_ids)
 
+    def _make_text_input(
+        self,
+        prompt: str,
+        tokenization_kwargs: Mapping[str, object],
+        timing_ctx: TimingContext,
+    ) -> MultiModalInput:
+        with timing_ctx.record("tokenize"):
+            prompt_token_ids = self._tokenize_text(prompt, tokenization_kwargs)
+
+        return mm_input(
+            prompt_token_ids=prompt_token_ids,
+            mm_kwargs=MultiModalKwargsItems({}),
+            mm_hashes={},
+            mm_placeholders={},
+            prompt=prompt,
+        )
+
+    def _get_image_replacements(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        mm_processor_kwargs: Mapping[str, object],
+        timing_ctx: TimingContext,
+    ) -> tuple[str, list[PromptReplacement], dict[str, int]]:
+        num_images = mm_items.get_count("image", strict=False)
+        image_aliases = self.image_tokenizer.placeholder_aliases()
+        image_placeholders = self._find_placeholders(prompt_text, image_aliases)
+
+        image_prompts: list[str] = []
+        if num_images > 0:
+            with timing_ctx.record("encode_apertus_images"):
+                image_items = mm_items.get_items("image", ImageProcessorItems)
+                images = image_items.get_all()
+                image_prompts = self.image_tokenizer.encode_images(
+                    images,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                )
+
+        if len(image_placeholders) < len(image_prompts):
+            raise ValueError(
+                "Apertus image placeholder/input mismatch: found "
+                f"{len(image_placeholders)} placeholder(s) in the prompt "
+                f"using aliases {image_aliases}, but received "
+                f"{len(image_prompts)} image input(s). "
+                "Received more images than placeholders; refusing to "
+                "silently drop or reorder images."
+            )
+        if len(image_placeholders) > len(image_prompts):
+            logger.info(
+                "[Apertus MM] prompt has %d image placeholder(s) but only %d "
+                "image input(s); extra placeholder(s) will be replaced by \"\"",
+                len(image_placeholders),
+                len(image_prompts),
+            )
+
+        if not image_placeholders:
+            return prompt_text, [], {}
+
+        return (
+            prompt_text,
+            [
+                PromptReplacement(
+                    modality="image",
+                    target=lambda item_idx: image_placeholders[item_idx],
+                    replacement=lambda item_idx: (
+                        image_prompts[item_idx]
+                        if item_idx < len(image_prompts)
+                        else ""
+                    ),
+                )
+            ],
+            {"image": len(image_placeholders)},
+        )
+
+    def _get_audio_replacements(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        mm_processor_kwargs: Mapping[str, object],
+        timing_ctx: TimingContext,
+    ) -> tuple[str, list[PromptReplacement], dict[str, int]]:
+        num_audios = mm_items.get_count("audio", strict=False)
+        audio_aliases = [ApertusAudioTokenizer.DEFAULT_AUDIO_PLACEHOLDER]
+        audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
+
+        audio_prompts: list[str] = []
+        if num_audios > 0:
+            tokenizer = self.info.get_tokenizer()
+            with timing_ctx.record("encode_apertus_audios"):
+                audio_items = mm_items.get_items("audio", AudioProcessorItems)
+                audios = audio_items.get_all()
+                audio_prompts = self.audio_tokenizer.encode_audios(
+                    audios,
+                    tokenizer=tokenizer,
+                    mm_processor_kwargs=mm_processor_kwargs,
+                )
+
+        if len(audio_placeholders) < len(audio_prompts):
+            raise ValueError(
+                "Apertus audio placeholder/input mismatch: found "
+                f"{len(audio_placeholders)} placeholder(s) in the prompt "
+                f"using aliases {audio_aliases}, but received "
+                f"{len(audio_prompts)} audio input(s). "
+                "Received more audios than placeholders; refusing to "
+                "silently drop or reorder audios."
+            )
+        if len(audio_placeholders) > len(audio_prompts):
+            logger.info(
+                "[Apertus MM] prompt has %d audio placeholder(s) but only %d "
+                "audio input(s); extra placeholder(s) will be replaced by \"\"",
+                len(audio_placeholders),
+                len(audio_prompts),
+            )
+
+        if not audio_placeholders:
+            return prompt_text, [], {}
+
+        return (
+            prompt_text,
+            [
+                PromptReplacement(
+                    modality="audio",
+                    target=lambda item_idx: audio_placeholders[item_idx],
+                    replacement=lambda item_idx: (
+                        audio_prompts[item_idx]
+                        if item_idx < len(audio_prompts)
+                        else ""
+                    ),
+                )
+            ],
+            {"audio": len(audio_placeholders)},
+        )
+
     def apply(
         self,
         inputs: ProcessorInputs,
@@ -275,137 +768,27 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             inputs.hf_processor_mm_kwargs
         )
 
-        num_images = inputs.mm_data_items.get_count("image", strict=False)
-        num_audios = inputs.mm_data_items.get_count("audio", strict=False)
-        image_aliases = self.image_tokenizer.placeholder_aliases(
-            tokenizer,
+        prompt_text, image_replacements, image_counts = self._get_image_replacements(
+            prompt_text,
+            inputs.mm_data_items,
             merged_mm_processor_kwargs,
+            timing_ctx,
         )
-        image_placeholders = self._find_placeholders(prompt_text, image_aliases)
-        audio_aliases = self.audio_tokenizer.placeholder_aliases(
-            merged_mm_processor_kwargs
+        prompt_text, audio_replacements, audio_counts = self._get_audio_replacements(
+            prompt_text,
+            inputs.mm_data_items,
+            merged_mm_processor_kwargs,
+            timing_ctx,
         )
-        audio_placeholders = self._find_placeholders(prompt_text, audio_aliases)
 
-        if image_placeholders and num_images == 0:
-            # Apertus behavior: remove surplus image placeholders when no image is
-            # provided for that position.
-            image_placeholder_removals = self._bind_and_group_updates(
-                [
-                    PromptReplacement(
-                        modality="image",
-                        target=lambda item_idx: image_placeholders[item_idx],
-                        replacement=lambda item_idx: "",
-                    )
-                ],
-                {"image": len(image_placeholders)},
-            )
-            logger.info(
-                "[Apertus MM] removing %d unresolved image placeholder(s) "
-                "because received 0 image input(s)",
-                len(image_placeholders),
-            )
-            prompt_text, _ = self._apply_text_matches(
+        prompt_replacements = image_replacements + audio_replacements
+        mm_counts = image_counts | audio_counts
+
+        if not prompt_replacements:
+            return self._make_text_input(
                 prompt_text,
-                image_placeholder_removals,
-            )
-            image_placeholders = []
-
-        if num_images == 0 and num_audios == 0:
-            if audio_placeholders:
-                raise ValueError(
-                    "Apertus audio placeholder/input mismatch: found "
-                    f"{len(audio_placeholders)} placeholder(s) in the prompt "
-                    f"using aliases {audio_aliases}, but received 0 audio input(s)."
-                )
-
-            with timing_ctx.record("tokenize"):
-                prompt_token_ids = self._tokenize_text(
-                    prompt_text,
-                    inputs.tokenization_kwargs,
-                )
-            return mm_input(
-                prompt_token_ids=prompt_token_ids,
-                mm_kwargs=MultiModalKwargsItems({}),
-                mm_hashes={},
-                mm_placeholders={},
-                prompt=prompt_text,
-            )
-
-        mm_counts: dict[str, int] = {}
-        prompt_replacements: list[PromptReplacement] = []
-
-        if num_images > 0:
-            with timing_ctx.record("encode_apertus_images"):
-                image_items = inputs.mm_data_items.get_items(
-                    "image", ImageProcessorItems
-                )
-                images = image_items.get_all()
-                image_prompts = self.image_tokenizer.encode_images(
-                    images,
-                    tokenizer=tokenizer,
-                    mm_processor_kwargs=merged_mm_processor_kwargs,
-                )
-
-            if len(image_placeholders) < len(image_prompts):
-                raise ValueError(
-                    "Apertus image placeholder/input mismatch: found "
-                    f"{len(image_placeholders)} placeholder(s) in the prompt "
-                    f"using aliases {image_aliases}, but received "
-                    f"{len(image_prompts)} image input(s). "
-                    "Received more images than placeholders; refusing to "
-                    "silently drop or reorder images."
-                )
-            if len(image_placeholders) > len(image_prompts):
-                logger.info(
-                    "[Apertus MM] prompt has %d image placeholder(s) but only %d "
-                    "image input(s); extra placeholder(s) will be replaced by \"\"",
-                    len(image_placeholders),
-                    len(image_prompts),
-                )
-            mm_counts["image"] = len(image_placeholders)
-            prompt_replacements.append(
-                PromptReplacement(
-                    modality="image",
-                    target=lambda item_idx: image_placeholders[item_idx],
-                    replacement=lambda item_idx: (
-                        image_prompts[item_idx] if item_idx < len(image_prompts) else ""
-                    ),
-                )
-            )
-
-        if num_audios > 0:
-            with timing_ctx.record("encode_apertus_audios"):
-                audio_items = inputs.mm_data_items.get_items(
-                    "audio", AudioProcessorItems
-                )
-                audios = audio_items.get_all()
-                audio_prompts = self.audio_tokenizer.encode_audios(
-                    audios,
-                    tokenizer=tokenizer,
-                    mm_processor_kwargs=merged_mm_processor_kwargs,
-                )
-
-            if len(audio_placeholders) != len(audio_prompts):
-                raise ValueError(
-                    "Apertus audio placeholder/input mismatch: found "
-                    f"{len(audio_placeholders)} placeholder(s) in the prompt "
-                    f"using aliases {audio_aliases}, but received "
-                    f"{len(audio_prompts)} audio input(s)."
-                )
-            mm_counts["audio"] = len(audio_prompts)
-            prompt_replacements.append(
-                PromptReplacement(
-                    modality="audio",
-                    target=lambda item_idx: audio_placeholders[item_idx],
-                    replacement=lambda item_idx: audio_prompts[item_idx],
-                )
-            )
-        elif audio_placeholders:
-            raise ValueError(
-                "Apertus audio placeholder/input mismatch: found "
-                f"{len(audio_placeholders)} placeholder(s) in the prompt using "
-                f"aliases {audio_aliases}, but received 0 audio input(s)."
+                inputs.tokenization_kwargs,
+                timing_ctx,
             )
 
         prompt_updates = self._bind_and_group_updates(prompt_replacements, mm_counts)
@@ -422,18 +805,10 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         ):
             raise RuntimeError("Failed to replace all Apertus multimodal placeholders.")
 
-        with timing_ctx.record("tokenize"):
-            prompt_token_ids = self._tokenize_text(
-                merged_prompt,
-                inputs.tokenization_kwargs,
-            )
-
-        return mm_input(
-            prompt_token_ids=prompt_token_ids,
-            mm_kwargs=MultiModalKwargsItems({}),
-            mm_hashes={},
-            mm_placeholders={},
-            prompt=merged_prompt,
+        return self._make_text_input(
+            merged_prompt,
+            inputs.tokenization_kwargs,
+            timing_ctx,
         )
 
 

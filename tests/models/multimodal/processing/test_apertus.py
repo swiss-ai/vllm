@@ -1,22 +1,22 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import sys
+import types
+
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
 from vllm.model_executor.models.apertus import (
-    ApertusForCausalLM,
-    ApertusMultiModalProcessor,
-)
-from vllm.model_executor.models.apertus_utils import (
     ApertusAudioTokenizer,
+    ApertusForCausalLM,
     ApertusImageTokenizer,
-    resolve_apertus_audio_tokenizer_codebase,
-    resolve_emu35_codebase,
+    ApertusMultiModalProcessor,
+    load_emu35_build_vision_tokenizer,
+    load_wavtokenizer40_class,
 )
-from vllm.multimodal.media import MediaWithBytes
 from vllm.multimodal.parse import MultiModalDataParser
 from vllm.multimodal.processing import ProcessorInputs, TimingContext
 
@@ -170,22 +170,23 @@ def run_processor(
     prompt: str,
     num_images: int = 0,
     num_audios: int = 0,
+    mm_processor_kwargs: dict[str, object] | None = None,
 ):
     return processor.apply(
         ProcessorInputs(
             prompt=prompt,
             mm_data_items=parse_mm_inputs(num_images=num_images, num_audios=num_audios),
+            hf_processor_mm_kwargs=mm_processor_kwargs or {},
         ),
         TimingContext(enabled=False),
     )
 
 
 def test_apertus_image_prompt_serialization_uses_expected_tokens():
-    tokenizer = DummyTokenizer()
     image_tokenizer = ApertusImageTokenizer()
     image_tokens = torch.tensor([[1, 2], [3, 4]])
 
-    prompt = image_tokenizer.build_apertus_image_prompt(image_tokens, tokenizer)
+    prompt = image_tokenizer.build_apertus_image_prompt(image_tokens)
 
     assert prompt == (
         "<|img_start|>2*2<|img_token_start|>"
@@ -196,29 +197,18 @@ def test_apertus_image_prompt_serialization_uses_expected_tokens():
     )
 
 
-def test_apertus_image_prompt_honors_tokenizer_special_tokens():
-    class CustomTokenizer(DummyTokenizer):
-        boi_token = "<BOI>"
-        img_token = "<IMG>"
-        eol_token = "<EOL>"
-        eoi_token = "<EOI>"
-
-    prompt = ApertusImageTokenizer().build_apertus_image_prompt(
-        torch.tensor([[8, 9]]),
-        CustomTokenizer(),
+def test_apertus_extracts_emu35_ibq_token_grid():
+    token_ids = torch.arange(6)
+    encode_out = (
+        torch.empty(1, 256, 2, 3),
+        0.0,
+        (None, None, token_ids),
     )
 
-    assert prompt == "<BOI>1*2<IMG><|visual token 8|><|visual token 9|><EOI>"
+    grid = ApertusImageTokenizer.extract_emu35_token_grid(encode_out, 2, 3)
 
-
-def test_apertus_image_tokenizer_unwraps_media_with_bytes():
-    image = Image.new("RGB", (16, 16), color=(3, 4, 5))
-    wrapped = MediaWithBytes(image, b"raw-bytes")
-
-    coerced = ApertusImageTokenizer.coerce_pil_image(wrapped)
-
-    assert isinstance(coerced, Image.Image)
-    assert coerced.size == image.size
+    assert grid.tolist() == [[0, 1, 2], [3, 4, 5]]
+    assert grid.dtype is torch.int64
 
 
 def test_apertus_processor_text_only():
@@ -486,100 +476,207 @@ def test_apertus_model_placeholder_str():
 
 
 def test_apertus_image_placeholder_aliases_include_apertus_default():
-    tokenizer = DummyTokenizer()
-    tokenizer.image_token = "<image>"
-    aliases = ApertusImageTokenizer.placeholder_aliases(tokenizer, {})
+    aliases = ApertusImageTokenizer.placeholder_aliases()
 
-    assert aliases == ["<image>", "<|image|>"]
+    assert aliases == ["<|image|>"]
 
 
-def test_apertus_image_placeholder_aliases_allow_explicit_override():
-    tokenizer = DummyTokenizer()
-    aliases = ApertusImageTokenizer.placeholder_aliases(
-        tokenizer,
-        {"apertus_image_placeholder": "<custom-image-token>"},
+def test_apertus_emu35_vision_tokenizer_loads_from_installed_package(monkeypatch):
+    module = types.ModuleType("vision_tokenizer")
+
+    def build_vision_tokenizer(**kwargs):
+        return kwargs
+
+    module.build_vision_tokenizer = build_vision_tokenizer
+
+    load_emu35_build_vision_tokenizer.cache_clear()
+    try:
+        monkeypatch.setitem(sys.modules, "vision_tokenizer", module)
+
+        assert load_emu35_build_vision_tokenizer() is build_vision_tokenizer
+    finally:
+        load_emu35_build_vision_tokenizer.cache_clear()
+
+
+def test_apertus_vision_tokenizer_device_comes_from_mm_kwargs(monkeypatch):
+    tokenizer = ApertusImageTokenizer()
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeVisionTokenizer:
+        pass
+
+    def fake_build_emu35_vision_tokenizer(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeVisionTokenizer()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.apertus.build_emu35_vision_tokenizer",
+        fake_build_emu35_vision_tokenizer,
     )
 
-    assert aliases == ["<custom-image-token>", "<|image|>"]
-
-
-def test_apertus_emu35_codebase_resolver_prefers_mm_kwargs(tmp_path):
-    module_dir = tmp_path / "src" / "vision_tokenizer"
-    module_dir.mkdir(parents=True)
-    (module_dir / "__init__.py").write_text("", encoding="utf-8")
-
-    assert resolve_emu35_codebase({"apertus_emu35_codebase": str(tmp_path)}) == tmp_path
-
-
-def test_apertus_emu35_codebase_resolver_uses_env_var(tmp_path, monkeypatch):
-    module_dir = tmp_path / "src" / "vision_tokenizer"
-    module_dir.mkdir(parents=True)
-    (module_dir / "__init__.py").write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_EMU35_CODEBASE", str(tmp_path))
-
-    assert resolve_emu35_codebase({}) == tmp_path
-
-
-def test_apertus_vision_tokenizer_device_resolution_priority(monkeypatch):
-    tokenizer = ApertusImageTokenizer()
-
-    monkeypatch.delenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", raising=False)
-    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
-    assert device == "cuda"
-    assert source == "default"
-
-    monkeypatch.setenv("VLLM_APERTUS_VISION_TOKENIZER_DEVICE", "cpu")
-    (device, source) = tokenizer._resolve_vision_tokenizer_device({})
-    assert device == "cpu"
-    assert source == "env:VLLM_APERTUS_VISION_TOKENIZER_DEVICE"
-
-    (device, source) = tokenizer._resolve_vision_tokenizer_device(
+    _, device, dtype = tokenizer.load_vision_tokenizer(
         {"apertus_vision_tokenizer_device": "cuda:1"}
     )
+
     assert device == "cuda:1"
-    assert source == "mm_processor_kwargs"
+    assert dtype is torch.float32
+    assert captured_kwargs["device"] == "cuda:1"
+    assert captured_kwargs["dtype"] is torch.float32
 
 
-def test_apertus_audio_codebase_resolver_accepts_env_var(tmp_path, monkeypatch):
-    paths = [
-        tmp_path
-        / "src"
-        / "audio_tokenizers"
-        / "implementations"
-        / "wavtokenizer.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        tmp_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
+def test_apertus_vision_tokenizer_cpu_uses_default_dtype(monkeypatch):
+    tokenizer = ApertusImageTokenizer()
+    captured_kwargs: dict[str, object] = {}
+
+    class FakeVisionTokenizer:
+        pass
+
+    def fake_build_emu35_vision_tokenizer(**kwargs):
+        captured_kwargs.update(kwargs)
+        return FakeVisionTokenizer()
+
+    monkeypatch.setattr(
+        "vllm.model_executor.models.apertus.build_emu35_vision_tokenizer",
+        fake_build_emu35_vision_tokenizer,
+    )
+
+    _, device, dtype = tokenizer.load_vision_tokenizer(
+        {"apertus_vision_tokenizer_device": "cpu"}
+    )
+
+    assert device == "cpu"
+    assert dtype is torch.float32
+    assert captured_kwargs["device"] == "cpu"
+    assert captured_kwargs["dtype"] is torch.float32
+
+
+def test_apertus_audio_tokenizer_loads_from_installed_package():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+
+    class FakeWavTokenizer40:
+        pass
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        assert load_wavtokenizer40_class() is FakeWavTokenizer40
+    load_wavtokenizer40_class.cache_clear()
+
+
+def test_apertus_audio_tokenizer_only_honors_operational_kwargs():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: dict[str, object] = {}
+
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.update(kwargs)
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        audio_tokenizer = ApertusAudioTokenizer().get_audio_tokenizer(
+            {
+                "apertus_audio_tokenizer_type": "other",
+                "apertus_audio_tokenizer_name": "OtherTokenizer",
+                "apertus_audio_tokenizer_compile": False,
+                "apertus_audio_tokenizer_device": "cpu",
+            }
+        )
+
+    assert isinstance(audio_tokenizer, FakeWavTokenizer40)
+    assert init_kwargs == {
+        "device": "cpu",
+        "torch_compile": False,
+    }
+    load_wavtokenizer40_class.cache_clear()
+
+
+def test_apertus_audio_tokenizer_cache_is_keyed_by_device():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: list[dict[str, object]] = []
+
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.append(dict(kwargs))
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        apertus_audio_tokenizer = ApertusAudioTokenizer()
+
+        cpu_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cpu"}
+        )
+        cuda0_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cuda:0"}
+        )
+        cached_cpu_tokenizer = apertus_audio_tokenizer.get_audio_tokenizer(
+            {"apertus_audio_tokenizer_device": "cpu"}
+        )
+
+    assert cpu_tokenizer is cached_cpu_tokenizer
+    assert cpu_tokenizer is not cuda0_tokenizer
+    assert init_kwargs == [
+        {
+            "device": "cpu",
+            "torch_compile": True,
+        },
+        {
+            "device": "cuda:0",
+            "torch_compile": True,
+        },
     ]
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(tmp_path))
-
-    assert resolve_apertus_audio_tokenizer_codebase({}) == tmp_path
+    load_wavtokenizer40_class.cache_clear()
 
 
-def test_apertus_audio_codebase_resolver_accepts_mm_processor_kwargs(
-    tmp_path, monkeypatch
-):
-    kwargs_path = tmp_path / "kwargs_codebase"
-    env_path = tmp_path / "env_codebase"
-    paths = [
-        kwargs_path
-        / "src"
-        / "audio_tokenizers"
-        / "implementations"
-        / "wavtokenizer.py",
-        kwargs_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        kwargs_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-        env_path / "src" / "audio_tokenizers" / "implementations" / "wavtokenizer.py",
-        env_path / "src" / "repos" / "wavtokenizer" / "encoder" / "utils.py",
-        env_path / "src" / "repos" / "wavtokenizer" / "decoder" / "pretrained.py",
-    ]
-    for path in paths:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("", encoding="utf-8")
-    monkeypatch.setenv("VLLM_APERTUS_AUDIO_TOKENIZER_CODEBASE", str(env_path))
+def test_apertus_processor_forwards_audio_mm_processor_kwargs():
+    tokenizer = DummyTokenizer()
+    processor = build_processor(tokenizer)
+    install_fake_encoders(processor)
+    captured_kwargs: dict[str, object] = {}
 
-    assert resolve_apertus_audio_tokenizer_codebase(
-        {"apertus_audio_tokenizer_codebase": str(kwargs_path)}
-    ) == kwargs_path
+    def encode_audios(audios, **kwargs):  # type: ignore[no-untyped-def]
+        del audios
+        captured_kwargs.update(kwargs["mm_processor_kwargs"])
+        return ["<AUD0>"]
+
+    processor.audio_tokenizer.encode_audios = encode_audios  # type: ignore[method-assign]
+
+    result = run_processor(
+        processor,
+        prompt="A<|audio|>B",
+        num_audios=1,
+        mm_processor_kwargs={
+            "apertus_audio_tokenizer_device": "cuda:1",
+            "apertus_audio_tokenizer_compile": False,
+        },
+    )
+
+    assert result["prompt"] == "A<AUD0>B"
+    assert captured_kwargs == {
+        "apertus_audio_tokenizer_device": "cuda:1",
+        "apertus_audio_tokenizer_compile": False,
+    }
+
+
+def test_apertus_audio_tokenizer_uses_explicit_checkpoint_path():
+    load_wavtokenizer40_class.cache_clear()
+    module = types.ModuleType("apertus_audio_tokenizer")
+    init_kwargs: dict[str, object] = {}
+
+    class FakeWavTokenizer40:
+        def __init__(self, **kwargs: object) -> None:
+            init_kwargs.update(kwargs)
+
+    module.WavTokenizer40 = FakeWavTokenizer40
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        monkeypatch.setitem(sys.modules, "apertus_audio_tokenizer", module)
+        ApertusAudioTokenizer().get_audio_tokenizer(
+            {"apertus_audio_tokenizer_path": "/tmp/wavtokenizer"}
+        )
+
+    assert init_kwargs["checkpoint"] == "/tmp/wavtokenizer"
+    load_wavtokenizer40_class.cache_clear()

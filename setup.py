@@ -1058,6 +1058,11 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
+        "apertus": [
+            "emu3p5 @ git+https://github.com/swiss-ai/Emu3.5.git",
+            "apertus-audio-tokenizer @ git+https://github.com/swiss-ai/apertus-audio-tokenizer.git",
+            "wavtokenizer @ git+https://github.com/swiss-ai/WavTokenizer.git",
+        ],  # Required for Apertus multimodal tokenization
         "video": [],  # Kept for backwards compatibility
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for AMD FP4 quantization support
