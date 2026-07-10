@@ -110,6 +110,24 @@ class ApertusProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> ApertusConfig:
         return self.ctx.get_hf_config(ApertusConfig)
 
+    def get_default_tok_params(self):
+        """The Apertus chat template renders ``{{ bos_token }}`` itself, so the
+        template owns BOS: when the tokenizer carries a chat template, default
+        tokenization must not add special tokens, or every offline
+        ``LLM.chat()`` prompt starts with a double BOS (``[1, 1, ...]``) --
+        a sequence the model was not trained on (apertus-program #420).
+        Base checkpoints (no chat template) keep the default so raw prompts
+        still get their BOS. Same pattern as vllm-project/vllm#39842 (Gemma 4)
+        and the ovis/ultravox/paligemma overrides.
+        """
+        tokenizer = self.ctx.get_tokenizer()
+        has_chat_template = getattr(tokenizer, "chat_template", None) is not None
+
+        params = super().get_default_tok_params()
+        if has_chat_template:
+            params = params.with_kwargs(add_special_tokens=False)
+        return params
+
     def get_data_parser(self) -> MultiModalDataParser:
         # Apertus audio tokenizer expects mono waveform at 24kHz.
         return MultiModalDataParser(
@@ -271,6 +289,16 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             if isinstance(inputs.prompt, str)
             else tokenizer.decode(inputs.prompt)
         )
+        # A token-id prompt was already tokenized upstream (the renderer applied
+        # add_special_tokens per the request), so the decoded text carries its
+        # BOS as literal text. Re-encoding below must not add another one, or
+        # every multimodal chat request starts ``[1, 1, ...]`` (double BOS,
+        # apertus-program #420). Only Apertus does this decode/re-encode round
+        # trip; the stock BaseMultiModalProcessor never re-tokenizes.
+        if not isinstance(inputs.prompt, str):
+            tokenization_kwargs = dict(inputs.tokenization_kwargs)
+            tokenization_kwargs.setdefault("add_special_tokens", False)
+            inputs.tokenization_kwargs = tokenization_kwargs
         merged_mm_processor_kwargs = self.info.ctx.get_merged_mm_kwargs(
             inputs.hf_processor_mm_kwargs
         )
