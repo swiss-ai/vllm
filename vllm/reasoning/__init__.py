@@ -20,9 +20,13 @@ Example:
 
 
 _REASONING_PARSERS_TO_REGISTER = {
-    "deepseek_r1": (  # name
-        "deepseek_r1_reasoning_parser",  # filename
-        "DeepSeekR1ReasoningParser",  # class_name
+    "apertus": (  # name
+        "apertus_reasoning_parser",  # filename
+        "ApertusReasoningParser",  # class_name
+    ),
+    "deepseek_r1": (
+        "deepseek_r1_reasoning_parser",
+        "DeepSeekR1ReasoningParser",
     ),
     "deepseek_v3": (
         "deepseek_v3_reasoning_parser",

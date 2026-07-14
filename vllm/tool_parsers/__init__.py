@@ -22,9 +22,13 @@ Example:
 
 
 _TOOL_PARSERS_TO_REGISTER = {
-    "deepseek_v3": (  # name
-        "deepseekv3_tool_parser",  # filename
-        "DeepSeekV3ToolParser",  # class_name
+    "apertus": (  # name
+        "apertus_tool_parser",  # filename
+        "ApertusToolParser",  # class_name
+    ),
+    "deepseek_v3": (
+        "deepseekv3_tool_parser",
+        "DeepSeekV3ToolParser",
     ),
     "deepseek_v31": (
         "deepseekv31_tool_parser",
