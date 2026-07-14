@@ -440,6 +440,17 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
                 audio_config=self.config.audio_config,
             )
 
+            loaded_keys.update(
+                    name
+                    for name, _ in self.vision_tower.named_parameters(
+                            prefix="vision_tower")
+                    )
+            loaded_keys.update(
+                    name
+                    for name, _ in self.audio_tower.named_parameters(
+                            prefix="audio_tower")
+                    )
+
         return loaded_keys
 
     def embed_multimodal(
