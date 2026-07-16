@@ -35,6 +35,7 @@ from transformers import ApertusConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import XIELU
 from vllm.model_executor.layers.attention import (
     Attention,
@@ -72,6 +73,8 @@ from .utils import (
     make_layers,
     maybe_prefix,
 )
+
+logger = init_logger(__name__)
 
 
 class ApertusMLP(nn.Module):
@@ -430,6 +433,14 @@ class ApertusForCausalLM(
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        output_vocab_size = getattr(config, "output_vocab_size", config.vocab_size)
+        if output_vocab_size != config.vocab_size:
+            logger.info(
+                "Using Apertus output_vocab_size=%s for lm_head "
+                "(input vocab_size=%s)",
+                output_vocab_size,
+                config.vocab_size,
+            )
 
         self.model = self._init_model(
             vllm_config=vllm_config,
@@ -439,7 +450,7 @@ class ApertusForCausalLM(
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                output_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
@@ -449,7 +460,7 @@ class ApertusForCausalLM(
 
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
-                config.vocab_size, scale=logit_scale
+                output_vocab_size, scale=logit_scale
             )
         else:
             self.lm_head = PPMissingLayer()
@@ -495,4 +506,24 @@ class ApertusForCausalLM(
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        def log_lm_head_weight(
+            weights: Iterable[tuple[str, torch.Tensor]],
+        ) -> Iterable[tuple[str, torch.Tensor]]:
+            for name, loaded_weight in weights:
+                if name == "lm_head.weight":
+                    logger.info(
+                        "Loading Apertus lm_head.weight with shape=%s "
+                        "for output_vocab_size=%s",
+                        tuple(loaded_weight.shape),
+                        getattr(
+                            self.config,
+                            "output_vocab_size",
+                            self.config.vocab_size,
+                        ),
+                    )
+                yield name, loaded_weight
+
+        return loader.load_weights(
+            log_lm_head_weight(weights), mapper=self.hf_to_vllm_mapper
+        )
