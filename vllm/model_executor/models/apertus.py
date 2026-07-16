@@ -438,8 +438,13 @@ class ApertusForCausalLM(
         )
 
         if get_pp_group().is_last_rank:
+            output_vocab_size = (
+                config.vocab_size
+                if config.tie_word_embeddings
+                else getattr(config, "output_vocab_size", config.vocab_size)
+            )
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                output_vocab_size,
                 config.hidden_size,
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
@@ -449,7 +454,7 @@ class ApertusForCausalLM(
 
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
-                config.vocab_size, scale=logit_scale
+                output_vocab_size, scale=logit_scale
             )
         else:
             self.lm_head = PPMissingLayer()
