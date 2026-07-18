@@ -10,24 +10,19 @@ Architecture Contract:
    ID substitution.
 """
 
-import json
-import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
-from huggingface_hub import try_to_load_from_cache
 from PIL import Image
-from safetensors import safe_open
 from transformers import Apertus1p5VisionTokenizerModel, AutoConfig, AutoModel
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
-from vllm.logger import init_logger
+from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -48,77 +43,23 @@ from vllm.multimodal.processing import (
     TimingContext,
 )
 from vllm.sequence import IntermediateTensors
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from .apertus import ApertusForCausalLM
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal
-from .utils import WeightsMapper
-
-logger = init_logger(__name__)
+from .utils import AutoWeightsLoader, WeightsMapper
 
 
-def _load_component_state_dict(
-    model_path: Path,
-    component_prefix: str,
-) -> dict[str, torch.Tensor]:
-    index_path = model_path / "model.safetensors.index.json"
-    if not index_path.is_file():
-        raise FileNotFoundError(
-            f"Apertus composite checkpoint index not found: {index_path}."
-        )
-
-    weight_map = json.loads(index_path.read_text())["weight_map"]
-    component_files = {
-        filename
-        for name, filename in weight_map.items()
-        if name.startswith(component_prefix)
-    }
-    if not component_files:
-        raise ValueError(
-            f"Apertus composite checkpoint has no weights for {component_prefix!r}."
-        )
-
-    state_dict: dict[str, torch.Tensor] = {}
-    for filename in sorted(component_files):
-        checkpoint_path = model_path / filename
-        if not checkpoint_path.is_file():
-            raise FileNotFoundError(
-                f"Apertus component checkpoint not found: {checkpoint_path}."
-            )
-        with safe_open(checkpoint_path, framework="pt", device="cpu") as checkpoint:
-            for name in tuple(checkpoint.keys()):
-                if name.startswith(component_prefix):
-                    key = name.removeprefix(component_prefix)
-                    state_dict[key] = checkpoint.get_tensor(name)
-
-    if not state_dict:
-        raise ValueError(
-            "Apertus component checkpoint files contain no "
-            f"{component_prefix!r} weights."
-        )
-    return state_dict
-
-
-def _load_component_model(
-    model_path: Path,
+def _init_component_model(
     component_config: Mapping[str, Any],
-    component_prefix: str,
-    device: str,
-    dtype: torch.dtype,
     model_cls: type[torch.nn.Module] | None = None,
 ) -> torch.nn.Module:
     config_dict = dict(component_config)
     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
-    model = AutoModel.from_config(config) if model_cls is None else model_cls(config)
-    model = model.to(device=device, dtype=dtype)
-    model.load_state_dict(
-        _load_component_state_dict(model_path, component_prefix), strict=True
-    )
-    return model.eval()
+    return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
 
 class ApertusImageTokenizer:
-    _vision_tokenizer_cache: dict[tuple[str, str, torch.dtype], torch.nn.Module] = {}
-
     def __init__(self, vision_config: Mapping[str, Any] | None = None) -> None:
         config = vision_config or {}
         self.min_pixels = config.get("min_pixels", 256 * 256)
@@ -183,41 +124,6 @@ class ApertusImageTokenizer:
         array = cls.image_array_to_uint8(array)
         return Image.fromarray(array).convert("RGB")
 
-    def load_vision_tokenizer(
-        self,
-        model_path: str,
-        device: str,
-        dtype: torch.dtype,
-        vision_config: Mapping[str, Any],
-    ) -> torch.nn.Module:
-        path = Path(model_path).expanduser()
-        assert path.exists() and path.is_dir(), (
-            f"Model directory {model_path} does not exist or is not a directory."
-        )
-
-        if device == "cpu" and dtype in (torch.float16, torch.bfloat16):
-            dtype = torch.float32
-
-        cache_key = (model_path, device, dtype)
-        if cache_key in self._vision_tokenizer_cache:
-            return self._vision_tokenizer_cache[cache_key]
-
-        logger.info(
-            "[Apertus MM] loading Apertus vision tokenizer on device=%r",
-            device,
-        )
-        vision_tokenizer = _load_component_model(
-            path,
-            device=device,
-            dtype=dtype,
-            component_config=vision_config,
-            component_prefix="model.vision_tokenizer.",
-            model_cls=Apertus1p5VisionTokenizerModel,
-        )
-
-        self._vision_tokenizer_cache[cache_key] = vision_tokenizer
-        return vision_tokenizer
-
     def preprocess_image_to_tensor(
         self, raw_image: Image.Image | np.ndarray | torch.Tensor
     ) -> tuple[torch.Tensor, int, int]:
@@ -237,44 +143,12 @@ class ApertusImageTokenizer:
 
 
 class ApertusAudioTokenizer:
-    _audio_tokenizer_cache: dict[tuple[str, str, torch.dtype], torch.nn.Module] = {}
-
     def __init__(self, audio_config: Mapping[str, Any] | None = None) -> None:
         config = audio_config or {}
         self.audio_placeholder = config.get("audio_placeholder", "<|audio|>")
         self.target_peak_dbfs = config.get("target_peak_dbfs", -3.0)
         self.audio_start_token = config.get("audio_start_token", "<|audio_start|>")
         self.audio_end_token = config.get("audio_end_token", "<|audio_end|>")
-
-    def load_audio_tokenizer(
-        self,
-        model_path: str,
-        device: str,
-        dtype: torch.dtype,
-        audio_config: Mapping[str, Any],
-    ) -> torch.nn.Module:
-        path = Path(model_path).expanduser()
-        assert path.exists() and path.is_dir(), (
-            f"Model directory {model_path} does not exist or is not a directory."
-        )
-
-        cache_key = (model_path, device, dtype)
-        if cache_key in self._audio_tokenizer_cache:
-            return self._audio_tokenizer_cache[cache_key]
-
-        logger.info(
-            "[Apertus MM] loading Apertus audio tokenizer on device=%r",
-            device,
-        )
-        audio_tokenizer = _load_component_model(
-            path,
-            device=device,
-            dtype=dtype,
-            component_config=audio_config,
-            component_prefix="model.audio_tokenizer.",
-        )
-        self._audio_tokenizer_cache[cache_key] = audio_tokenizer
-        return audio_tokenizer
 
     def preprocess_audio_to_tensor(
         self, raw_audio: np.ndarray
@@ -604,7 +478,11 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
 )
 class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
     hf_to_vllm_mapper = ApertusForCausalLM.hf_to_vllm_mapper | WeightsMapper(
-        orig_to_new_prefix={"model.language_model.": "model."}
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.vision_tokenizer.": "vision_tower.",
+            "model.audio_tokenizer.": "audio_tower.",
+        }
     )
     allow_patterns_overrides = ["model-apertus-model-*.safetensors"]
 
@@ -626,12 +504,39 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self.vllm_config = vllm_config
         config = vllm_config.model_config.hf_config
         self.image_tokenizer = ApertusImageTokenizer(config.vision_tokenizer_config)
         self.audio_tokenizer = ApertusAudioTokenizer(config.audio_tokenizer_config)
+
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
+        if get_pp_group().is_first_rank:
+            self.secondary_weights = [
+                DefaultModelLoader.Source(
+                    model_or_path=vllm_config.model_config.model,
+                    revision=vllm_config.model_config.revision,
+                    allow_patterns_overrides=[
+                        "model-vision_tokenizer-model.safetensors"
+                    ],
+                ),
+                DefaultModelLoader.Source(
+                    model_or_path=vllm_config.model_config.model,
+                    revision=vllm_config.model_config.revision,
+                    allow_patterns_overrides=["model-wavtokenizer-model.safetensors"],
+                ),
+            ]
+            with set_default_torch_dtype(torch.float32):
+                with self._mark_tower_model(vllm_config, "image"):
+                    self.vision_tower = _init_component_model(
+                        config.vision_tokenizer_config,
+                        model_cls=Apertus1p5VisionTokenizerModel,
+                    )
+                with self._mark_tower_model(vllm_config, "audio"):
+                    self.audio_tower = _init_component_model(
+                        config.audio_tokenizer_config,
+                    )
+        else:
+            self.secondary_weights = []
 
         self.image_token_offset = config.vision_tokenizer_config.get(
             "image_token_offset"
@@ -664,75 +569,12 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        loaded_keys = super().load_weights(weights)
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else []
+        if not get_pp_group().is_first_rank:
+            skip_prefixes.extend(["vision_tower.", "audio_tower."])
 
-        # Encoders are only executed on the first pipeline stage (first PP rank)
-        if get_pp_group().is_first_rank:
-            # Resolve the local path of the model directory (local or cached)
-            model_id = self.vllm_config.model_config.model
-            revision = self.vllm_config.model_config.revision
-            config = self.vllm_config.model_config.hf_config
-
-            if os.path.isdir(model_id):
-                model_path = os.path.abspath(model_id)
-            else:
-                try:
-                    cached_file = try_to_load_from_cache(
-                        repo_id=model_id,
-                        filename="config.json",
-                        revision=revision,
-                    )
-                    if cached_file:
-                        model_path = os.path.dirname(cached_file)
-                    else:
-                        model_path = getattr(config, "_name_or_path", model_id)
-                except Exception:
-                    # Fallback to the HF configuration's _name_or_path
-                    model_path = getattr(config, "_name_or_path", model_id)
-
-            # Multimodal tokenizers use FP32 independently of the backbone.
-            try:
-                sample_param = next(self.parameters())
-                target_device = sample_param.device
-            except StopIteration:
-                target_device = torch.device("cuda")
-            tokenizer_dtype = torch.float32
-
-            logger.info(
-                "[Apertus Worker] Loading Vision Tower natively on %s (%s)",
-                target_device,
-                tokenizer_dtype,
-            )
-            self.vision_tower = self.image_tokenizer.load_vision_tokenizer(
-                model_path=model_path,
-                device=str(target_device),
-                dtype=tokenizer_dtype,
-                vision_config=config.vision_tokenizer_config,
-            )
-
-            logger.info(
-                "[Apertus Worker] Loading Audio Tower natively on %s",
-                target_device,
-            )
-            self.audio_tower = self.audio_tokenizer.load_audio_tokenizer(
-                model_path=model_path,
-                device=str(target_device),
-                dtype=tokenizer_dtype,
-                audio_config=config.audio_tokenizer_config,
-            )
-
-            loaded_keys.update(
-                name
-                for name, _ in self.vision_tower.named_parameters(
-                    prefix="vision_tower"
-                )
-            )
-            loaded_keys.update(
-                name
-                for name, _ in self.audio_tower.named_parameters(prefix="audio_tower")
-            )
-
-        return loaded_keys
+        loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
+        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def _get_module_device_dtype(
         self,
@@ -745,19 +587,23 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         self,
         image: torch.Tensor,
     ) -> torch.Tensor:
-        target_device, target_dtype = self._get_module_device_dtype(self.vision_tower)
+        vision_tower = self.vision_tower
+        assert vision_tower is not None
+        target_device, target_dtype = self._get_module_device_dtype(vision_tower)
         image = image.unsqueeze(0).to(device=target_device, dtype=target_dtype)
         with torch.inference_mode():
-            valid_codes = self.vision_tower.encode(image).flatten()
+            valid_codes = vision_tower.encode(image).flatten()
         return valid_codes.to(torch.long) + self.image_token_offset
 
     def _encode_audio_to_llm_ids(
         self,
         audio: torch.Tensor,
     ) -> torch.Tensor:
-        target_device, target_dtype = self._get_module_device_dtype(self.audio_tower)
+        audio_tower = self.audio_tower
+        assert audio_tower is not None
+        target_device, target_dtype = self._get_module_device_dtype(audio_tower)
         with torch.inference_mode():
-            output = self.audio_tower.encode(
+            output = audio_tower.encode(
                 audio.unsqueeze(0).unsqueeze(0).to(
                     device=target_device, dtype=target_dtype
                 )
