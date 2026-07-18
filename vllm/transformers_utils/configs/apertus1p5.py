@@ -14,11 +14,6 @@ class Apertus1p5Config(ApertusConfig):
         text_config: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
-        if "vision_tokenizer_config" not in kwargs:
-            kwargs["vision_tokenizer_config"] = kwargs.pop("vision_config", {})
-        if "audio_tokenizer_config" not in kwargs:
-            kwargs["audio_tokenizer_config"] = kwargs.pop("audio_config", {})
-
         text_config = dict(text_config or {})
         text_config.pop("model_type", None)
         kwargs.update(text_config)
