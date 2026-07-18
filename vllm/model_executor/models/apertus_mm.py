@@ -65,7 +65,7 @@ class ApertusImageTokenizer:
         self.min_pixels = config.get("min_pixels", 256 * 256)
         self.max_pixels = config.get("max_pixels", 1400 * 1400)
         self.image_placeholder = config.get("image_placeholder", "<|image|>")
-        self.ds_factor = config["ds_factor"]
+        self.ds_factor = config.get("ds_factor", 16)
         self.boi_token = config.get("boi_token", "<|img_start|>")
         self.img_token = config.get("img_token", "<|img_token_start|>")
         self.eol_token = config.get("eol_token", "<|img_end_of_row|>")
@@ -208,12 +208,11 @@ class ApertusProcessingInfo(BaseProcessingInfo):
         vision_config = self.get_hf_config().vision_tokenizer_config
         ds_factor = vision_config.get("ds_factor", 16)
         max_px = vision_config.get("max_pixels", 1400 * 1400)
-        audio_config = self.get_hf_config().audio_tokenizer_config
-        tokens_per_second = audio_config.get("tokens_per_second", 40)
 
         return {
             "image": min((max_px // (ds_factor * ds_factor)) + 512, seq_len),
-            "audio": min((tokens_per_second * 300) + 4, seq_len),
+            # 40 tokens/sec for 24 kHz audio, up to 300 sec, plus 4 special tokens.
+            "audio": min((40 * 300) + 4, seq_len),
         }
 
 
@@ -274,12 +273,12 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         self.audio_tokenizer = ApertusAudioTokenizer(audio_config)
         self.dummy_image_token = "<|visual token 0|>"
         self.dummy_audio_token = "<|audio token 0|>"
-        self.dummy_image_token_id = vision_config.get("image_token_offset")
-        self.dummy_audio_token_id = audio_config.get("audio_token_offset")
-        self.image_start_token_id = vision_config.get("image_start_token_id")
-        self.image_end_token_id = vision_config.get("image_end_token_id")
-        self.audio_start_token_id = audio_config.get("audio_start_token_id")
-        self.audio_end_token_id = audio_config.get("audio_end_token_id")
+        self.dummy_image_token_id = vision_config.get("image_token_offset", 131272)
+        self.dummy_audio_token_id = audio_config.get("audio_token_offset", 262344)
+        self.image_start_token_id = vision_config.get("image_start_token_id", 131073)
+        self.image_end_token_id = vision_config.get("image_end_token_id", 131074)
+        self.audio_start_token_id = audio_config.get("audio_start_token_id", 131080)
+        self.audio_end_token_id = audio_config.get("audio_end_token_id", 131081)
 
     def _get_mm_fields_config(
         self,
@@ -539,10 +538,10 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
             self.secondary_weights = []
 
         self.image_token_offset = config.vision_tokenizer_config.get(
-            "image_token_offset"
+            "image_token_offset", 131272
         )
         self.audio_token_offset = config.audio_tokenizer_config.get(
-            "audio_token_offset"
+            "audio_token_offset", 262344
         )
 
     def get_language_model(self):
