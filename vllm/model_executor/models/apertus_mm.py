@@ -155,6 +155,10 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         audio_config = info.get_hf_config().audio_config
         self.image_tokenizer = ApertusImageTokenizer(vision_config)
         self.audio_tokenizer = ApertusAudioTokenizer(audio_config)
+        self.dummy_image_token = "<|visual token 0|>"
+        self.dummy_image_token_id = vision_config["token_offset"]
+        self.dummy_audio_token = "<|audio token 0|>"
+        self.dummy_audio_token_id = audio_config["token_offset"]
 
     def _get_mm_fields_config(
         self,
@@ -222,12 +226,6 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             tokenization_kwargs.setdefault("add_special_tokens", False)
             inputs.tokenization_kwargs = tokenization_kwargs
 
-        config = self.info.get_hf_config()
-
-        # Must be defined as distinct single tokens in tokenizer.json
-        dummy_img_token = getattr(config, "dummy_image_token", "<|visual token 0|>")
-        dummy_aud_token = getattr(config, "dummy_audio_token", "<|audio token 0|>")
-
         num_images = inputs.mm_data_items.get_count("image", strict=False)
         num_audios = inputs.mm_data_items.get_count("audio", strict=False)
 
@@ -243,7 +241,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 pixel_values, image_layouts = [], []
                 for image in images:
                     value, layout = self._preprocess_image_item(
-                        image, dummy_img_token
+                        image, self.dummy_image_token
                     )
                     pixel_values.append(value)
                     image_layouts.append(layout)
@@ -263,7 +261,9 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 ).get_all()
                 audio_values, audio_layouts = [], []
                 for audio in audios:
-                    value, layout = self._preprocess_audio_item(audio, dummy_aud_token)
+                    value, layout = self._preprocess_audio_item(
+                        audio, self.dummy_audio_token
+                    )
                     audio_values.append(value)
                     audio_layouts.append(layout)
 
@@ -330,14 +330,14 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             mm_placeholders["image"] = _span_ranges(
                 self.image_tokenizer.boi_token,
                 self.image_tokenizer.eoi_token,
-                getattr(config, "dummy_image_token_id", 131272),
+                self.dummy_image_token_id,
                 num_images,
             )
         if num_audios > 0:
             mm_placeholders["audio"] = _span_ranges(
                 self.audio_tokenizer.audio_start_token,
                 self.audio_tokenizer.audio_end_token,
-                getattr(config, "dummy_audio_token_id", 262344),
+                self.dummy_audio_token_id,
                 num_audios,
             )
 
@@ -383,21 +383,10 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         self.vision_tower: IBQ | None = None
         self.audio_tower: WavTokenizer40 | None = None
 
-        dummy_image_token_id = getattr(config, "dummy_image_token_id", 131272)
-        dummy_audio_token_id = getattr(config, "dummy_audio_token_id", 262344)
         self.image_token_offset = self.config.vision_config["token_offset"]
         assert self.image_token_offset, "vision_config.token_offset must be set"
         self.audio_token_offset = self.config.audio_config["token_offset"]
         assert self.audio_token_offset, "audio_config.token_offset must be set"
-        # Register the dummy placeholder token IDs to vLLM.
-        # This tells the vLLM engine to automatically construct the boolean mask
-        # (is_multimodal) matching these positions, allowing the engine to slice
-        # and route multimodal embeddings to the correct locations in the input
-        # sequence.
-        self.configure_mm_token_handling(
-            vocab_size=config.vocab_size,
-            mm_token_ids=[dummy_image_token_id, dummy_audio_token_id],
-        )
 
     def get_language_model(self):
         return self.model
