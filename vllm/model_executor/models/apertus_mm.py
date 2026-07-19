@@ -582,41 +582,77 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         parameter = next(module.parameters())
         return parameter.device, parameter.dtype
 
-    def _encode_image_to_llm_ids(
+    def _encode_images_to_llm_ids(
         self,
-        image: torch.Tensor,
-    ) -> torch.Tensor:
+        images: Sequence[torch.Tensor],
+    ) -> list[torch.Tensor]:
         vision_tower = self.vision_tower
         assert vision_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(vision_tower)
-        image = image.unsqueeze(0).to(device=target_device, dtype=target_dtype)
-        with torch.inference_mode():
-            valid_codes = vision_tower.encode(image).flatten()
-        return valid_codes.to(torch.long) + self.image_token_offset
+        image_sizes = [(image.shape[-2], image.shape[-1]) for image in images]
+        max_height = max(height for height, _ in image_sizes)
+        max_width = max(width for _, width in image_sizes)
+        pixel_values = torch.stack(
+            [
+                torch.nn.functional.pad(
+                    image,
+                    (0, max_width - width, 0, max_height - height),
+                )
+                for image, (height, width) in zip(images, image_sizes)
+            ]
+        ).to(device=target_device, dtype=target_dtype)
 
-    def _encode_audio_to_llm_ids(
+        with torch.inference_mode():
+            image_codes = vision_tower.encode(pixel_values)
+
+        ds_factor = self.image_tokenizer.ds_factor
+        return [
+            image_codes[index, : height // ds_factor, : width // ds_factor]
+            .flatten()
+            .to(torch.long)
+            + self.image_token_offset
+            for index, (height, width) in enumerate(image_sizes)
+        ]
+
+    def _encode_audios_to_llm_ids(
         self,
-        audio: torch.Tensor,
-    ) -> torch.Tensor:
+        audios: Sequence[torch.Tensor],
+    ) -> list[torch.Tensor]:
         audio_tower = self.audio_tower
         assert audio_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(audio_tower)
+        audio_lengths = [audio.shape[-1] for audio in audios]
+        max_length = max(audio_lengths)
+        audio_values = torch.stack(
+            [
+                torch.nn.functional.pad(audio, (0, max_length - length))
+                for audio, length in zip(audios, audio_lengths)
+            ]
+        ).unsqueeze(1)
+        padding_mask = torch.arange(max_length).unsqueeze(0) < torch.tensor(
+            audio_lengths
+        ).unsqueeze(1)
+
         with torch.inference_mode():
             output = audio_tower.encode(
-                audio.unsqueeze(0).unsqueeze(0).to(
-                    device=target_device, dtype=target_dtype
-                )
+                audio_values.to(device=target_device, dtype=target_dtype),
+                padding_mask=padding_mask.to(device=target_device),
             )
-            valid_codes = output.audio_codes.squeeze(0).squeeze(0)
+        assert output.audio_codes_mask is not None
 
-        return valid_codes.to(torch.long) + self.audio_token_offset
+        return [
+            codes[mask].to(torch.long) + self.audio_token_offset
+            for codes, mask in zip(
+                output.audio_codes[:, 0], output.audio_codes_mask[:, 0].bool()
+            )
+        ]
 
     def _parse_mm_modality_and_encoder(
         self,
         **kwargs: object,
     ) -> tuple[
         torch.Tensor | list[torch.Tensor],
-        Callable[[torch.Tensor], torch.Tensor],
+        Callable[[Sequence[torch.Tensor]], list[torch.Tensor]],
     ] | None:
         pixel_values = kwargs.get("pixel_values")
         audio_values = kwargs.get("audio_values")
@@ -625,11 +661,11 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         if pixel_values is not None:
             if self.vision_tower is None:
                 return None
-            return pixel_values, self._encode_image_to_llm_ids
+            return pixel_values, self._encode_images_to_llm_ids
         if audio_values is not None:
             if self.audio_tower is None:
                 return None
-            return audio_values, self._encode_audio_to_llm_ids
+            return audio_values, self._encode_audios_to_llm_ids
 
         return None
 
@@ -650,7 +686,7 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
 
         items = list(values.unbind(0)) if isinstance(values, torch.Tensor) else values
 
-        ids_per_item = [encode_to_llm_ids(item) for item in items]
+        ids_per_item = encode_to_llm_ids(items)
         lengths = [ids.shape[0] for ids in ids_per_item]
 
         all_ids = torch.cat(ids_per_item).to(device)
