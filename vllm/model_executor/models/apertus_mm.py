@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import Apertus1p5VisionTokenizerModel, AutoConfig, AutoModel
 
@@ -22,6 +23,8 @@ from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
@@ -47,7 +50,7 @@ from vllm.utils.torch_utils import set_default_torch_dtype
 
 from .apertus import ApertusForCausalLM
 from .interfaces import MultiModalEmbeddings, SupportsMultiModal
-from .utils import AutoWeightsLoader, WeightsMapper
+from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
 
 _MIN_IMAGE_SIDE = 256
 _MIN_IMAGE_PIXELS = _MIN_IMAGE_SIDE**2
@@ -81,6 +84,16 @@ _DEFAULT_IMAGE_START_TOKEN_ID = 131073
 _DEFAULT_IMAGE_END_TOKEN_ID = 131074
 _DEFAULT_AUDIO_START_TOKEN_ID = 131080
 _DEFAULT_AUDIO_END_TOKEN_ID = 131081
+
+
+def _pad_logits_to_input_vocab(
+    logits: torch.Tensor, input_vocab_size: int
+) -> torch.Tensor:
+    return F.pad(
+        logits,
+        (0, input_vocab_size - logits.shape[-1]),
+        value=float("-inf"),
+    )
 
 
 def _init_component_model(
@@ -295,7 +308,7 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
                 overrides=image_overrides,
             ),
             "audio": self._get_dummy_audios(
-                length=_AUDIO_SAMPLE_RATE,
+                length=_AUDIO_SAMPLE_RATE*_MAX_AUDIO_SECONDS,
                 num_audios=mm_counts.get("audio", 0),
                 overrides=audio_overrides,
             ),
@@ -569,6 +582,28 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
 
+        output_vocab_size = getattr(config, "output_vocab_size", config.vocab_size)
+        if output_vocab_size > config.vocab_size:
+            raise ValueError("Output vocabulary cannot exceed input vocabulary.")
+        self._input_vocab_size = config.vocab_size
+        self._should_pad_logits_to_input_vocab = False
+        if (
+            get_pp_group().is_last_rank
+            and not config.tie_word_embeddings
+            and output_vocab_size != config.vocab_size
+        ):
+            self.lm_head = ParallelLMHead(
+                output_vocab_size,
+                config.hidden_size,
+                quant_config=vllm_config.quant_config,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
+            logit_scale = getattr(config, "logit_scale", 1.0)
+            self.logits_processor = LogitsProcessor(
+                output_vocab_size, scale=logit_scale
+            )
+            self._should_pad_logits_to_input_vocab = True
+
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
         if get_pp_group().is_first_rank:
@@ -608,6 +643,12 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
 
     def get_language_model(self):
         return self.model
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        logits = super().compute_logits(hidden_states)
+        if logits is None or not self._should_pad_logits_to_input_vocab:
+            return logits
+        return _pad_logits_to_input_vocab(logits, self._input_vocab_size)
 
     def forward(
         self,
