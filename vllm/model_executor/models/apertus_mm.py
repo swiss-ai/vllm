@@ -188,30 +188,6 @@ def _init_component_model(
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
 
-class Apertus1p5ImageTokenizer:
-    def __init__(self, tokenizer: Any | None = None) -> None:
-        self.image_placeholder = getattr(
-            tokenizer, "image_token", _DEFAULT_IMAGE_PLACEHOLDER
-        )
-        self.boi_token = getattr(tokenizer, "boi_token", _DEFAULT_BOI_TOKEN)
-        self.img_token = getattr(tokenizer, "image_wrapper_token", _DEFAULT_IMG_TOKEN)
-        self.eol_token = getattr(tokenizer, "eol_token", _DEFAULT_EOL_TOKEN)
-        self.eoi_token = getattr(tokenizer, "eoi_token", _DEFAULT_EOI_TOKEN)
-
-
-class Apertus1p5AudioTokenizer:
-    def __init__(self, tokenizer: Any | None = None) -> None:
-        self.audio_placeholder = getattr(
-            tokenizer, "audio_token", _DEFAULT_AUDIO_PLACEHOLDER
-        )
-        self.audio_start_token = getattr(
-            tokenizer, "audio_start_token", _DEFAULT_AUDIO_START_TOKEN
-        )
-        self.audio_end_token = getattr(
-            tokenizer, "audio_end_token", _DEFAULT_AUDIO_END_TOKEN
-        )
-
-
 class Apertus1p5ProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.get_hf_processor().feature_extractor
@@ -363,13 +339,19 @@ class Apertus1p5MultiModalProcessor(
         super().__init__(info, dummy_inputs, cache=cache)
         tokenizer = info.get_tokenizer()
         self.hf_processor = info.get_hf_processor()
-        self.image_tokenizer = Apertus1p5ImageTokenizer(tokenizer)
-        self.audio_tokenizer = Apertus1p5AudioTokenizer(tokenizer)
         self.image_token_id = getattr(
             tokenizer, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID
         )
         self.audio_token_id = getattr(
             tokenizer, "audio_token_id", _DEFAULT_AUDIO_TOKEN_ID
+        )
+        self.image_start_token = getattr(tokenizer, "boi_token", _DEFAULT_BOI_TOKEN)
+        self.image_end_token = getattr(tokenizer, "eoi_token", _DEFAULT_EOI_TOKEN)
+        self.audio_start_token = getattr(
+            tokenizer, "audio_start_token", _DEFAULT_AUDIO_START_TOKEN
+        )
+        self.audio_end_token = getattr(
+            tokenizer, "audio_end_token", _DEFAULT_AUDIO_END_TOKEN
         )
         self.image_start_token_id = getattr(
             tokenizer, "boi_token_id", _DEFAULT_IMAGE_START_TOKEN_ID
@@ -596,18 +578,18 @@ class Apertus1p5MultiModalProcessor(
         mm_placeholders: dict[str, list[PlaceholderRange]] = {}
         if num_images > 0:
             mm_placeholders["image"] = _span_ranges(
-                self.image_tokenizer.boi_token,
+                self.image_start_token,
                 self.image_start_token_id,
-                self.image_tokenizer.eoi_token,
+                self.image_end_token,
                 self.image_end_token_id,
                 self.image_token_id,
                 num_images,
             )
         if num_audios > 0:
             mm_placeholders["audio"] = _span_ranges(
-                self.audio_tokenizer.audio_start_token,
+                self.audio_start_token,
                 self.audio_start_token_id,
-                self.audio_tokenizer.audio_end_token,
+                self.audio_end_token,
                 self.audio_end_token_id,
                 self.audio_token_id,
                 num_audios,
