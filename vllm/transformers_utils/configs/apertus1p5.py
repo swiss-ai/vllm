@@ -17,5 +17,4 @@ class Apertus1p5Config(ApertusConfig):
         text_config = dict(text_config or {})
         text_config.pop("model_type", None)
         kwargs.update(text_config)
-        kwargs.setdefault("architectures", ["ApertusForConditionalGeneration"])
         super().__init__(**kwargs)

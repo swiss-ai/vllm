@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-Multimodal Apertus Pipeline optimized for native vLLM asynchronous execution.
+Multimodal Apertus 1.5 pipeline optimized for native vLLM asynchronous execution.
 
 Architecture Contract:
 1. Processor (CPU): HuggingFace-compatible media preprocessing and prompt
@@ -188,7 +188,7 @@ def _init_component_model(
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
 
-class ApertusImageTokenizer:
+class Apertus1p5ImageTokenizer:
     def __init__(self, tokenizer: Any | None = None) -> None:
         self.image_placeholder = getattr(
             tokenizer, "image_token", _DEFAULT_IMAGE_PLACEHOLDER
@@ -199,7 +199,7 @@ class ApertusImageTokenizer:
         self.eoi_token = getattr(tokenizer, "eoi_token", _DEFAULT_EOI_TOKEN)
 
 
-class ApertusAudioTokenizer:
+class Apertus1p5AudioTokenizer:
     def __init__(self, tokenizer: Any | None = None) -> None:
         self.audio_placeholder = getattr(
             tokenizer, "audio_token", _DEFAULT_AUDIO_PLACEHOLDER
@@ -212,7 +212,7 @@ class ApertusAudioTokenizer:
         )
 
 
-class ApertusProcessingInfo(BaseProcessingInfo):
+class Apertus1p5ProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.get_hf_processor().feature_extractor
         _log_apertus_mm(
@@ -293,7 +293,7 @@ class ApertusProcessingInfo(BaseProcessingInfo):
         return limits
 
 
-class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
+class Apertus1p5DummyInputsBuilder(BaseDummyInputsBuilder[Apertus1p5ProcessingInfo]):
     def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
         tokenizer = self.info.get_tokenizer()
         image_placeholder = getattr(
@@ -348,12 +348,14 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
         return dummy_data
 
 
-class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo]):
+class Apertus1p5MultiModalProcessor(
+    BaseMultiModalProcessor[Apertus1p5ProcessingInfo]
+):
     """CPU-bound API Processor. Strict YAGNI Rule: NO heavy neural networks run here."""
 
     def __init__(
         self,
-        info: ApertusProcessingInfo,
+        info: Apertus1p5ProcessingInfo,
         dummy_inputs: BaseDummyInputsBuilder,
         *,
         cache: object | None = None,
@@ -361,8 +363,8 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         super().__init__(info, dummy_inputs, cache=cache)
         tokenizer = info.get_tokenizer()
         self.hf_processor = info.get_hf_processor()
-        self.image_tokenizer = ApertusImageTokenizer(tokenizer)
-        self.audio_tokenizer = ApertusAudioTokenizer(tokenizer)
+        self.image_tokenizer = Apertus1p5ImageTokenizer(tokenizer)
+        self.audio_tokenizer = Apertus1p5AudioTokenizer(tokenizer)
         self.image_token_id = getattr(
             tokenizer, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID
         )
@@ -635,11 +637,11 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
 
 
 @MULTIMODAL_REGISTRY.register_processor(
-    ApertusMultiModalProcessor,
-    info=ApertusProcessingInfo,
-    dummy_inputs=ApertusDummyInputsBuilder,
+    Apertus1p5MultiModalProcessor,
+    info=Apertus1p5ProcessingInfo,
+    dummy_inputs=Apertus1p5DummyInputsBuilder,
 )
-class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
+class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
     hf_to_vllm_mapper = ApertusForCausalLM.hf_to_vllm_mapper | WeightsMapper(
         orig_to_new_prefix={
             "model.language_model.": "model.",
