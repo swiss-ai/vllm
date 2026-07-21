@@ -10,9 +10,14 @@ Architecture Contract:
    ID substitution.
 """
 
+import hashlib
+import json
+import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from contextvars import ContextVar
 from math import isqrt
 from typing import Any
+from uuid import uuid4
 
 import torch
 import torch.nn.functional as F
@@ -22,6 +27,7 @@ from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
 from vllm.distributed import get_pp_group
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
+from vllm.logger import init_logger
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.model_loader import DefaultModelLoader
@@ -73,6 +79,95 @@ _DEFAULT_IMAGE_END_TOKEN_ID = 131074
 _DEFAULT_AUDIO_START_TOKEN_ID = 131080
 _DEFAULT_AUDIO_END_TOKEN_ID = 131081
 
+_apertus_mm_trace_id: ContextVar[str | None] = ContextVar(
+    "apertus_mm_trace_id", default=None
+)
+logger = init_logger(__name__)
+
+
+def _apertus_mm_debug_enabled() -> bool:
+    """Return whether opt-in Apertus multimodal diagnostics are enabled."""
+    return os.getenv("VLLM_APERTUS_MM_DEBUG", "").lower() in {"1", "true", "yes"}
+
+
+def _tensor_debug_info(value: object) -> dict[str, object] | None:
+    """Summarize a tensor without logging prompt, media, or embedding values."""
+    if not _apertus_mm_debug_enabled():
+        return None
+    if value is None:
+        return None
+    if not isinstance(value, torch.Tensor):
+        return {"type": type(value).__name__}
+
+    info: dict[str, object] = {
+        "shape": list(value.shape),
+        "dtype": str(value.dtype),
+        "device": str(value.device),
+        "numel": value.numel(),
+    }
+    if value.numel() == 0:
+        return info
+
+    flat = value.detach().reshape(-1)
+    sample_count = min(64, flat.numel())
+    sample_indices = torch.linspace(
+        0,
+        flat.numel() - 1,
+        steps=sample_count,
+        device=value.device,
+        dtype=torch.long,
+    )
+    sample = flat.index_select(0, sample_indices).to(dtype=torch.float32, device="cpu")
+    sample_prefix = f"{value.dtype}:{list(value.shape)}:".encode()
+    info["sample_sha256"] = hashlib.sha256(
+        sample_prefix + sample.contiguous().numpy().tobytes()
+    ).hexdigest()[:16]
+    if value.numel() <= 250_000:
+        raw = value.detach().contiguous().flatten().view(torch.uint8).cpu()
+        info["sha256"] = hashlib.sha256(raw.numpy().tobytes()).hexdigest()
+
+    # These reductions intentionally synchronize device tensors only when the
+    # explicitly opt-in diagnostic mode is enabled.
+    if value.dtype == torch.bool:
+        info["true_count"] = int(value.sum().item())
+    else:
+        info["min"] = value.min().item()
+        info["max"] = value.max().item()
+    if value.is_floating_point():
+        info["finite"] = bool(torch.isfinite(value).all().item())
+    return info
+
+
+def _items_debug_info(values: object) -> dict[str, object]:
+    """Summarize a batched multimodal value and each of its items."""
+    if isinstance(values, torch.Tensor):
+        return {
+            "container": "tensor",
+            "batch": _tensor_debug_info(values),
+            "items": [_tensor_debug_info(item) for item in values.unbind(0)],
+        }
+    if isinstance(values, (list, tuple)):
+        return {
+            "container": type(values).__name__,
+            "items": [
+                _tensor_debug_info(item)
+                if isinstance(item, torch.Tensor)
+                else {"type": type(item).__name__}
+                for item in values
+            ],
+        }
+    return {"container": type(values).__name__}
+
+
+def _log_apertus_mm(event: str, **fields: object) -> None:
+    """Write one machine-readable Apertus multimodal diagnostic record."""
+    if not _apertus_mm_debug_enabled():
+        return
+    record = {"event": event, "pid": os.getpid(), **fields}
+    if trace_id := _apertus_mm_trace_id.get():
+        record["trace_id"] = trace_id
+    logger.info("APERTUS_MM %s", json.dumps(record, sort_keys=True, default=str))
+
 
 def _pad_logits_to_input_vocab(
     logits: torch.Tensor, input_vocab_size: int
@@ -120,6 +215,12 @@ class ApertusAudioTokenizer:
 class ApertusProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
         feature_extractor = self.get_hf_processor().feature_extractor
+        _log_apertus_mm(
+            "data_parser_configured",
+            sampling_rate=feature_extractor.sampling_rate,
+            target_channels=1,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
         return MultiModalDataParser(
             target_sr=feature_extractor.sampling_rate,
             target_channels=1,
@@ -142,6 +243,11 @@ class ApertusProcessingInfo(BaseProcessingInfo):
         params = super().get_default_tok_params()
         if has_chat_template:
             params = params.with_kwargs(add_special_tokens=False)
+        _log_apertus_mm(
+            "tokenization_defaults",
+            has_chat_template=has_chat_template,
+            add_special_tokens=not has_chat_template,
+        )
         return params
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
@@ -152,11 +258,10 @@ class ApertusProcessingInfo(BaseProcessingInfo):
         seq_len: int,
         mm_counts: Mapping[str, int],
     ) -> Mapping[str, int] | None:
-        del mm_counts
         processor = self.get_hf_processor()
         image_processor = processor.image_processor
         feature_extractor = processor.feature_extractor
-        return {
+        limits = {
             # Maximum image codes plus room for the image layout's wrapper
             # and row-separator tokens.
             "image": min(
@@ -176,6 +281,16 @@ class ApertusProcessingInfo(BaseProcessingInfo):
                 seq_len,
             ),
         }
+        _log_apertus_mm(
+            "multimodal_token_limits",
+            seq_len=seq_len,
+            mm_counts=dict(mm_counts),
+            limits=limits,
+            image_max_pixels=image_processor.max_pixels,
+            image_spatial_factor=image_processor.spatial_factor,
+            audio_sampling_rate=feature_extractor.sampling_rate,
+        )
+        return limits
 
 
 class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
@@ -187,9 +302,15 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
         audio_placeholder = getattr(
             tokenizer, "audio_token", _DEFAULT_AUDIO_PLACEHOLDER
         )
-        return image_placeholder * mm_counts.get(
+        dummy_text = image_placeholder * mm_counts.get(
             "image", 0
         ) + audio_placeholder * mm_counts.get("audio", 0)
+        _log_apertus_mm(
+            "dummy_text_built",
+            mm_counts=dict(mm_counts),
+            character_count=len(dummy_text),
+        )
+        return dummy_text
 
     def get_dummy_mm_data(
         self,
@@ -202,7 +323,7 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
         processor = self.info.get_hf_processor()
         max_image_side = isqrt(processor.image_processor.max_pixels)
 
-        return {
+        dummy_data = {
             "image": self._get_dummy_images(
                 width=max_image_side,
                 height=max_image_side,
@@ -215,6 +336,16 @@ class ApertusDummyInputsBuilder(BaseDummyInputsBuilder[ApertusProcessingInfo]):
                 overrides=audio_overrides,
             ),
         }
+        _log_apertus_mm(
+            "dummy_mm_data_built",
+            seq_len=seq_len,
+            mm_counts=dict(mm_counts),
+            image_side=max_image_side,
+            audio_length=(
+                processor.feature_extractor.sampling_rate * _MAX_AUDIO_SECONDS
+            ),
+        )
+        return dummy_data
 
 
 class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo]):
@@ -250,6 +381,17 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         self.audio_end_token_id = getattr(
             tokenizer, "audio_end_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
         )
+        _log_apertus_mm(
+            "processor_initialized",
+            image_token_id=self.image_token_id,
+            image_start_token_id=self.image_start_token_id,
+            image_end_token_id=self.image_end_token_id,
+            audio_token_id=self.audio_token_id,
+            audio_start_token_id=self.audio_start_token_id,
+            audio_end_token_id=self.audio_end_token_id,
+            image_processor=type(self.hf_processor.image_processor).__name__,
+            feature_extractor=type(self.hf_processor.feature_extractor).__name__,
+        )
 
     def _get_mm_fields_config(
         self,
@@ -260,10 +402,17 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         # The first argument of batched() is the MODALITY
         # ("image"/"audio"), not the field name -- the engine looks items up
         # by modality during profiling and scheduling.
-        return {
+        fields_config = {
             "pixel_values": MultiModalFieldConfig.batched("image"),
             "audio_values": MultiModalFieldConfig.batched("audio"),
         }
+        _log_apertus_mm(
+            "multimodal_field_config",
+            hf_input_type=type(hf_inputs).__name__,
+            processor_kwarg_keys=sorted(hf_processor_mm_kwargs),
+            field_names=sorted(fields_config),
+        )
+        return fields_config
 
     def _get_prompt_updates(self, *args: Any, **kwargs: Any) -> Sequence[PromptUpdate]:
         return []
@@ -271,11 +420,12 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
     def apply(
         self, inputs: ProcessorInputs, timing_ctx: TimingContext
     ) -> MultiModalInput:
+        if _apertus_mm_debug_enabled():
+            _apertus_mm_trace_id.set(uuid4().hex)
         tokenizer = self.info.get_tokenizer()
+        prompt_is_text = isinstance(inputs.prompt, str)
         prompt_text = (
-            inputs.prompt
-            if isinstance(inputs.prompt, str)
-            else tokenizer.decode(inputs.prompt)
+            inputs.prompt if prompt_is_text else tokenizer.decode(inputs.prompt)
         )
 
         tokenization_kwargs = dict(inputs.tokenization_kwargs)
@@ -286,7 +436,7 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
         # every multimodal chat request starts ``[1, 1, ...]`` (double BOS,
         # apertus-program #420). Only Apertus does this decode/re-encode round
         # trip; the stock BaseMultiModalProcessor never re-tokenizes.
-        if not isinstance(inputs.prompt, str):
+        if not prompt_is_text:
             tokenization_kwargs.setdefault("add_special_tokens", False)
 
         num_images = inputs.mm_data_items.get_count("image", strict=False)
@@ -303,6 +453,18 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             else None
         )
 
+        _log_apertus_mm(
+            "processor_input",
+            prompt_is_text=prompt_is_text,
+            prompt_characters=len(prompt_text),
+            prompt_token_count=(len(inputs.prompt) if not prompt_is_text else None),
+            media_counts={"image": num_images, "audio": num_audios},
+            tokenization_kwarg_keys=sorted(tokenization_kwargs),
+            add_special_tokens=tokenization_kwargs.get("add_special_tokens"),
+            image_items=_items_debug_info(images),
+            audio_items=_items_debug_info(audios),
+        )
+
         mm_kwargs: dict[str, torch.Tensor | list[torch.Tensor]] = {}
         mm_counts: dict[str, int] = {}
 
@@ -316,6 +478,18 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 **tokenization_kwargs,
             )
             prompt_token_ids = hf_outputs["input_ids"][0].tolist()
+
+        _log_apertus_mm(
+            "processor_hf_output",
+            output_keys=sorted(hf_outputs.keys()),
+            input_ids=_tensor_debug_info(hf_outputs["input_ids"]),
+            pixel_values=_tensor_debug_info(hf_outputs.get("pixel_values")),
+            image_sizes=_tensor_debug_info(hf_outputs.get("image_sizes")),
+            input_features=_tensor_debug_info(hf_outputs.get("input_features")),
+            feature_attention_mask=_tensor_debug_info(
+                hf_outputs.get("feature_attention_mask")
+            ),
+        )
 
         if num_images > 0:
             pixel_values = [
@@ -339,12 +513,25 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             mm_kwargs["audio_values"] = audio_values
             mm_counts["audio"] = len(audio_values)
 
+        _log_apertus_mm(
+            "processor_mm_kwargs",
+            media_counts=mm_counts,
+            pixel_values=_items_debug_info(mm_kwargs.get("pixel_values")),
+            audio_values=_items_debug_info(mm_kwargs.get("audio_values")),
+        )
+
         # mm_input() requires mm_hashes and mm_placeholders
         # since upstream 08a8a4af. Placeholders are one PlaceholderRange per
         # item spanning its layout tokens, with is_embed marking the positions
         # the GPU worker overwrites.
         with timing_ctx.record("get_mm_hashes"):
             mm_hashes = inputs.get_mm_hashes(self.info.model_id)
+
+        _log_apertus_mm(
+            "processor_mm_hashes",
+            modalities=sorted(mm_hashes),
+            counts={modality: len(hashes) for modality, hashes in mm_hashes.items()},
+        )
 
         def _span_ranges(
             start_token: str,
@@ -359,11 +546,23 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
             # special tokens cannot merge with surrounding text under BPE.
             ranges: list[PlaceholderRange] = []
             pos = 0
-            for _ in range(count):
+            for item_index in range(count):
                 try:
                     s = prompt_token_ids.index(start_id, pos)
                     e = prompt_token_ids.index(end_id, s)
                 except ValueError as exc:
+                    _log_apertus_mm(
+                        "placeholder_search_failed",
+                        modality=(
+                            "image"
+                            if start_id == self.image_start_token_id
+                            else "audio"
+                        ),
+                        search_from=pos,
+                        expected_start_id=start_id,
+                        expected_end_id=end_id,
+                        prompt_token_count=len(prompt_token_ids),
+                    )
                     raise ValueError(
                         f"Apertus MM: {start_token!r}/{end_token!r} pair not "
                         f"found in prompt (search from {pos})"
@@ -374,6 +573,20 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 )
                 ranges.append(
                     PlaceholderRange(offset=s, length=e - s + 1, is_embed=is_embed)
+                )
+                _log_apertus_mm(
+                    "placeholder_span",
+                    modality=(
+                        "image" if start_id == self.image_start_token_id else "audio"
+                    ),
+                    item_index=item_index,
+                    offset=s,
+                    length=e - s + 1,
+                    start_token_id=span[0],
+                    end_token_id=span[-1],
+                    embed_token_id=embed_token_id,
+                    embed_token_count=int(is_embed.sum().item()),
+                    search_next=e + 1,
                 )
                 pos = e + 1
             return ranges
@@ -397,6 +610,19 @@ class ApertusMultiModalProcessor(BaseMultiModalProcessor[ApertusProcessingInfo])
                 self.audio_token_id,
                 num_audios,
             )
+
+        _log_apertus_mm(
+            "processor_complete",
+            prompt_token_count=len(prompt_token_ids),
+            media_counts=mm_counts,
+            placeholder_counts={
+                modality: len(ranges) for modality, ranges in mm_placeholders.items()
+            },
+            placeholder_embed_token_counts={
+                modality: sum(int(item.is_embed.sum().item()) for item in ranges)
+                for modality, ranges in mm_placeholders.items()
+            },
+        )
 
         return mm_input(
             prompt_token_ids=prompt_token_ids,
@@ -429,10 +655,18 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
-            return _DEFAULT_IMAGE_PLACEHOLDER
-        if modality.startswith("audio"):
-            return _DEFAULT_AUDIO_PLACEHOLDER
-        raise ValueError(f"Unsupported modality: {modality}")
+            placeholder = _DEFAULT_IMAGE_PLACEHOLDER
+        elif modality.startswith("audio"):
+            placeholder = _DEFAULT_AUDIO_PLACEHOLDER
+        else:
+            raise ValueError(f"Unsupported modality: {modality}")
+        _log_apertus_mm(
+            "placeholder_string_resolved",
+            modality=modality,
+            item_index=i,
+            placeholder=placeholder,
+        )
+        return placeholder
 
     """
     GPU Worker Domain.
@@ -501,6 +735,25 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         self.audio_token_offset = getattr(
             config, "audio_token_offset", _DEFAULT_AUDIO_TOKEN_OFFSET
         )
+        _log_apertus_mm(
+            "model_initialized",
+            pipeline_rank_first=get_pp_group().is_first_rank,
+            pipeline_rank_last=get_pp_group().is_last_rank,
+            input_vocab_size=self._input_vocab_size,
+            output_vocab_size=output_vocab_size,
+            image_token_offset=self.image_token_offset,
+            audio_token_offset=self.audio_token_offset,
+            vision_tower=(
+                type(self.vision_tower).__name__
+                if self.vision_tower is not None
+                else None
+            ),
+            audio_tower=(
+                type(self.audio_tower).__name__
+                if self.audio_tower is not None
+                else None
+            ),
+        )
 
     def get_language_model(self):
         return self.model
@@ -537,7 +790,13 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
             skip_prefixes.extend(["vision_tower.", "audio_tower."])
 
         loader = AutoWeightsLoader(self, skip_prefixes=skip_prefixes)
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        _log_apertus_mm(
+            "weights_loaded",
+            loaded_weight_count=len(loaded),
+            skip_prefixes=skip_prefixes,
+        )
+        return loaded
 
     def _get_module_device_dtype(
         self,
@@ -553,10 +812,28 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         vision_tower = self.vision_tower
         assert vision_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(vision_tower)
+        _log_apertus_mm(
+            "image_encode_input",
+            image=_tensor_debug_info(image),
+            tower_device=str(target_device),
+            tower_dtype=str(target_dtype),
+            token_offset=self.image_token_offset,
+        )
         image = image.unsqueeze(0).to(device=target_device, dtype=target_dtype)
         with torch.inference_mode():
             valid_codes = vision_tower.encode(image).flatten()
-        return valid_codes.to(torch.long) + self.image_token_offset
+        llm_ids = valid_codes.to(torch.long) + self.image_token_offset
+        _log_apertus_mm(
+            "image_encode_output",
+            tokenizer_codes=_tensor_debug_info(valid_codes),
+            llm_token_ids=_tensor_debug_info(llm_ids),
+            offset_applied_exactly=bool(
+                torch.equal(
+                    llm_ids - self.image_token_offset, valid_codes.to(torch.long)
+                )
+            ),
+        )
+        return llm_ids
 
     def _encode_audio_to_llm_ids(
         self,
@@ -565,6 +842,13 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         audio_tower = self.audio_tower
         assert audio_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(audio_tower)
+        _log_apertus_mm(
+            "audio_encode_input",
+            audio=_tensor_debug_info(audio),
+            tower_device=str(target_device),
+            tower_dtype=str(target_dtype),
+            token_offset=self.audio_token_offset,
+        )
         with torch.inference_mode():
             output = audio_tower.encode(
                 audio.unsqueeze(0)
@@ -573,17 +857,36 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
             )
             valid_codes = output.audio_codes.squeeze(0).squeeze(0)
 
-        return valid_codes.to(torch.long) + self.audio_token_offset
+        llm_ids = valid_codes.to(torch.long) + self.audio_token_offset
+        _log_apertus_mm(
+            "audio_encode_output",
+            tokenizer_codes=_tensor_debug_info(valid_codes),
+            llm_token_ids=_tensor_debug_info(llm_ids),
+            offset_applied_exactly=bool(
+                torch.equal(
+                    llm_ids - self.audio_token_offset, valid_codes.to(torch.long)
+                )
+            ),
+        )
+        return llm_ids
 
     def _process_modality_input(
         self,
         values: torch.Tensor | list[torch.Tensor],
         encode_fn: Callable[[torch.Tensor], torch.Tensor],
         device: torch.device,
+        modality: str,
     ) -> list[torch.Tensor]:
         """Encodes inputs for a single modality and retrieves their embeddings."""
         items = list(values.unbind(0)) if isinstance(values, torch.Tensor) else values
+        _log_apertus_mm(
+            "embedding_batch_input",
+            modality=modality,
+            items=_items_debug_info(values),
+            embedding_device=str(device),
+        )
         if not items:
+            _log_apertus_mm("embedding_batch_empty", modality=modality)
             return []
 
         ids_per_item = [encode_fn(item) for item in items]
@@ -591,7 +894,15 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
 
         all_ids = torch.cat(ids_per_item).to(device)
         all_embeds = super().embed_input_ids(all_ids)
-        return list(all_embeds.split(lengths))
+        embeddings = list(all_embeds.split(lengths))
+        _log_apertus_mm(
+            "embedding_batch_output",
+            modality=modality,
+            code_lengths=lengths,
+            llm_token_ids=_tensor_debug_info(all_ids),
+            embeddings=_items_debug_info(embeddings),
+        )
+        return embeddings
 
     def embed_multimodal(
         self,
@@ -604,6 +915,14 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
             device = torch.device("cuda")
 
         multimodal_embeddings: list[torch.Tensor] = []
+        embedding_order: list[dict[str, int | str]] = []
+        _log_apertus_mm(
+            "embed_multimodal_start",
+            kwarg_keys=list(kwargs),
+            embedding_device=str(device),
+            has_vision_tower=self.vision_tower is not None,
+            has_audio_tower=self.audio_tower is not None,
+        )
 
         # Iterate over keys of kwargs to preserve modality order
         for input_key in kwargs:
@@ -614,8 +933,17 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
                         pixel_values,  # type: ignore
                         self._encode_image_to_llm_ids,
                         device,
+                        "image",
                     )
                     multimodal_embeddings.extend(image_embeds)
+                    embedding_order.extend(
+                        {
+                            "modality": "image",
+                            "item_index": item_index,
+                            "token_count": embedding.shape[0],
+                        }
+                        for item_index, embedding in enumerate(image_embeds)
+                    )
             elif input_key == "audio_values":
                 audio_values = kwargs[input_key]
                 if audio_values is not None and self.audio_tower is not None:
@@ -623,9 +951,25 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
                         audio_values,  # type: ignore
                         self._encode_audio_to_llm_ids,
                         device,
+                        "audio",
                     )
                     multimodal_embeddings.extend(audio_embeds)
+                    embedding_order.extend(
+                        {
+                            "modality": "audio",
+                            "item_index": item_index,
+                            "token_count": embedding.shape[0],
+                        }
+                        for item_index, embedding in enumerate(audio_embeds)
+                    )
 
+        _log_apertus_mm(
+            "embed_multimodal_complete",
+            embedding_items=_items_debug_info(multimodal_embeddings),
+            embedding_order=embedding_order,
+            embedding_item_count=len(multimodal_embeddings),
+            embedding_token_count=sum(item.shape[0] for item in multimodal_embeddings),
+        )
         return multimodal_embeddings
 
     def embed_input_ids(
@@ -641,9 +985,33 @@ class ApertusForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
         # overwrites the rows corresponding to the dummy placeholders (where
         # is_multimodal is True) with the high-fidelity visual/audio
         # embeddings generated in embed_multimodal.
-        return SupportsMultiModal.embed_input_ids(
+        embedding_items = (
+            multimodal_embeddings
+            if isinstance(multimodal_embeddings, (list, tuple))
+            else ([] if multimodal_embeddings is None else [multimodal_embeddings])
+        )
+        _log_apertus_mm(
+            "embed_input_ids_before_merge",
+            input_ids=_tensor_debug_info(input_ids),
+            is_multimodal=_tensor_debug_info(is_multimodal),
+            multimodal_embedding_items=_items_debug_info(embedding_items),
+            multimodal_embedding_token_count=sum(
+                item.shape[0]
+                for item in embedding_items
+                if isinstance(item, torch.Tensor)
+            ),
+            placeholder_token_count=(
+                int(is_multimodal.sum().item()) if is_multimodal is not None else None
+            ),
+        )
+        output = SupportsMultiModal.embed_input_ids(
             self,
             input_ids,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
         )
+        _log_apertus_mm(
+            "embed_input_ids_after_merge",
+            output_embeddings=_tensor_debug_info(output),
+        )
+        return output
