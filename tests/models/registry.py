@@ -776,7 +776,8 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         },
     ),
     "Apertus1p5ForConditionalGeneration": _HfExamplesInfo(
-        "swiss-ai/Apertus-v1.5-8B"
+        "swiss-ai/Apertus-v1.5-8B",
+        min_transformers_version="5.14",        # TODO: Update to the latest released Transformers version.
     ),
     "BagelForConditionalGeneration": _HfExamplesInfo("ByteDance-Seed/BAGEL-7B-MoT"),
     "BeeForConditionalGeneration": _HfExamplesInfo(
