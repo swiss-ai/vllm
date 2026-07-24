@@ -775,6 +775,9 @@ _MULTIMODAL_EXAMPLE_MODELS = {
             "vllm": "Needs https://github.com/huggingface/transformers/pull/43538"
         },
     ),
+    "Apertus1p5ForConditionalGeneration": _HfExamplesInfo(
+        "swiss-ai/Apertus-v1.5-8B"
+    ),
     "BagelForConditionalGeneration": _HfExamplesInfo("ByteDance-Seed/BAGEL-7B-MoT"),
     "BeeForConditionalGeneration": _HfExamplesInfo(
         "Open-Bee/Bee-8B-RL",
