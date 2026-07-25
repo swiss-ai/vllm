@@ -405,7 +405,8 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
             "model.audio_tokenizer.": "audio_tower.",
         }
     )
-    allow_patterns_overrides = ["model-apertus-model-*.safetensors"]
+
+    allow_patterns_overrides = None
 
     # Required by vLLM's chat serving to insert the
     # modality placeholder when flattening OpenAI content parts. Without it
@@ -451,21 +452,10 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
 
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
+        # A single primary source now yields the vision/audio tensors too (routed by
+        # hf_to_vllm_mapper)
+        self.secondary_weights = []
         if get_pp_group().is_first_rank:
-            self.secondary_weights = [
-                DefaultModelLoader.Source(
-                    model_or_path=vllm_config.model_config.model,
-                    revision=vllm_config.model_config.revision,
-                    allow_patterns_overrides=[
-                        "model-vision_tokenizer-model.safetensors"
-                    ],
-                ),
-                DefaultModelLoader.Source(
-                    model_or_path=vllm_config.model_config.model,
-                    revision=vllm_config.model_config.revision,
-                    allow_patterns_overrides=["model-wavtokenizer-model.safetensors"],
-                ),
-            ]
             with set_default_torch_dtype(torch.float32):
                 with self._mark_tower_model(vllm_config, "image"):
                     self.vision_tower = _init_component_model(
@@ -476,8 +466,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
                     self.audio_tower = _init_component_model(
                         config.audio_tokenizer_config,
                     )
-        else:
-            self.secondary_weights = []
 
         self.image_token_offset = getattr(
             config, "image_token_offset", _DEFAULT_IMAGE_TOKEN_OFFSET
