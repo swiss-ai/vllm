@@ -44,9 +44,21 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from .apertus import ApertusForCausalLM
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .apertus import ApertusForCausalLM, ApertusModel
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from .utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    WeightsMapper,
+    maybe_prefix,
+)
 
 _IMAGE_TOKEN_BUDGET_OVERHEAD = 512
 _MAX_AUDIO_SECONDS = 300
@@ -367,14 +379,23 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
     info=Apertus1p5ProcessingInfo,
     dummy_inputs=Apertus1p5DummyInputsBuilder,
 )
-class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
+class Apertus1p5ForConditionalGeneration(
+    torch.nn.Module,
+    SupportsMultiModal,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+):
     hf_to_vllm_mapper = ApertusForCausalLM.hf_to_vllm_mapper | WeightsMapper(
         orig_to_new_prefix={
-            "model.language_model.": "model.",
+            "model.language_model.": "language_model.",
             "model.vision_tokenizer.": "vision_tower.",
             "model.audio_tokenizer.": "audio_tower.",
         }
     )
+    packed_modules_mapping = ApertusForCausalLM.packed_modules_mapping
+    embedding_modules = ApertusForCausalLM.embedding_modules
     allow_patterns_overrides = ["model-apertus-model-*.safetensors"]
 
     @classmethod
@@ -386,35 +407,46 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
         config = vllm_config.model_config.hf_config
         text_config = vllm_config.model_config.hf_text_config
-        super().__init__(
-            vllm_config=vllm_config.with_hf_config(text_config), prefix=prefix
+        self.config = config
+
+        with self._mark_language_model(vllm_config):
+            self.language_model = ApertusModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
         )
 
-        output_vocab_size = getattr(
-            text_config, "output_vocab_size", text_config.vocab_size
+        output_vocab_size = (
+            getattr(text_config, "output_vocab_size", None) or text_config.vocab_size
         )
         if output_vocab_size > text_config.vocab_size:
             raise ValueError("Output vocabulary cannot exceed input vocabulary.")
         self._input_vocab_size = text_config.vocab_size
-        self._should_pad_logits_to_input_vocab = False
-        if (
-            get_pp_group().is_last_rank
-            and not text_config.tie_word_embeddings
-            and output_vocab_size != text_config.vocab_size
-        ):
+        self._should_pad_logits_to_input_vocab = (
+            output_vocab_size != text_config.vocab_size
+        )
+        if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 output_vocab_size,
                 text_config.hidden_size,
                 quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if config.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(
+                    self.language_model.embed_tokens
+                )
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
                 output_vocab_size, scale=logit_scale
             )
-            self._should_pad_logits_to_input_vocab = True
+        else:
+            self.lm_head = PPMissingLayer()
 
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
@@ -454,10 +486,10 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         )
 
     def get_language_model(self):
-        return self.model
+        return self.language_model
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = super().compute_logits(hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None or not self._should_pad_logits_to_input_vocab:
             return logits
         return _pad_logits_to_input_vocab(logits, self._input_vocab_size)
@@ -470,7 +502,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        return self.model(
+        return self.language_model(
             input_ids,
             positions,
             intermediate_tensors,
@@ -481,7 +513,11 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else []
+        skip_prefixes = (
+            ["lm_head."]
+            if self.config.tie_word_embeddings
+            else []
+        )
         if not get_pp_group().is_first_rank:
             skip_prefixes.extend(["vision_tower.", "audio_tower."])
 
@@ -541,7 +577,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         lengths = [ids.shape[0] for ids in ids_per_item]
 
         all_ids = torch.cat(ids_per_item).to(device)
-        all_embeds = super().embed_input_ids(all_ids)
+        all_embeds = self.language_model.embed_input_ids(all_ids)
         return list(all_embeds.split(lengths))
 
     def embed_multimodal(
