@@ -8,7 +8,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import Apertus1p5VisionTokenizerModel, AutoConfig, AutoModel
+from transformers import (
+    Apertus1p5VisionTokenizerModel,
+    AutoConfig,
+    AutoModel,
+    PretrainedConfig,
+)
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -76,10 +81,10 @@ def _pad_logits_to_input_vocab(
 
 
 def _init_component_model(
-    component_config: Mapping[str, Any],
+    component_config: PretrainedConfig,
     model_cls: type[torch.nn.Module] | None = None,
 ) -> torch.nn.Module:
-    config_dict = dict(component_config)
+    config_dict = component_config.to_dict()
     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
@@ -381,22 +386,27 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         raise ValueError(f"Unsupported modality: {modality}")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
         config = vllm_config.model_config.hf_config
+        text_config = vllm_config.model_config.hf_text_config
+        super().__init__(
+            vllm_config=vllm_config.with_hf_config(text_config), prefix=prefix
+        )
 
-        output_vocab_size = getattr(config, "output_vocab_size", config.vocab_size)
-        if output_vocab_size > config.vocab_size:
+        output_vocab_size = getattr(
+            text_config, "output_vocab_size", text_config.vocab_size
+        )
+        if output_vocab_size > text_config.vocab_size:
             raise ValueError("Output vocabulary cannot exceed input vocabulary.")
-        self._input_vocab_size = config.vocab_size
+        self._input_vocab_size = text_config.vocab_size
         self._should_pad_logits_to_input_vocab = False
         if (
             get_pp_group().is_last_rank
-            and not config.tie_word_embeddings
-            and output_vocab_size != config.vocab_size
+            and not text_config.tie_word_embeddings
+            and output_vocab_size != text_config.vocab_size
         ):
             self.lm_head = ParallelLMHead(
                 output_vocab_size,
-                config.hidden_size,
+                text_config.hidden_size,
                 quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
@@ -460,7 +470,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        # Multimodal inputs are encoded before the language model forward pass.
         return self.model(
             input_ids,
             positions,
@@ -577,7 +586,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         is_multimodal: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        # Use vLLM's standard multimodal embedding merge.
         return SupportsMultiModal.embed_input_ids(
             self,
             input_ids,
