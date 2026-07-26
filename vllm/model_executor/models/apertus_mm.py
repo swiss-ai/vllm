@@ -394,9 +394,10 @@ class Apertus1p5ForConditionalGeneration(
             "model.audio_tokenizer.": "audio_tower.",
         }
     )
+
     packed_modules_mapping = ApertusForCausalLM.packed_modules_mapping
     embedding_modules = ApertusForCausalLM.embedding_modules
-    allow_patterns_overrides = ["model-apertus-model-*.safetensors"]
+    allow_patterns_overrides = None
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -450,21 +451,10 @@ class Apertus1p5ForConditionalGeneration(
 
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
+        # A single primary source now yields the vision/audio tensors too (routed by
+        # hf_to_vllm_mapper)
+        self.secondary_weights = []
         if get_pp_group().is_first_rank:
-            self.secondary_weights = [
-                DefaultModelLoader.Source(
-                    model_or_path=vllm_config.model_config.model,
-                    revision=vllm_config.model_config.revision,
-                    allow_patterns_overrides=[
-                        "model-vision_tokenizer-model.safetensors"
-                    ],
-                ),
-                DefaultModelLoader.Source(
-                    model_or_path=vllm_config.model_config.model,
-                    revision=vllm_config.model_config.revision,
-                    allow_patterns_overrides=["model-wavtokenizer-model.safetensors"],
-                ),
-            ]
             with set_default_torch_dtype(torch.float32):
                 with self._mark_tower_model(vllm_config, "image"):
                     self.vision_tower = _init_component_model(
@@ -475,8 +465,6 @@ class Apertus1p5ForConditionalGeneration(
                     self.audio_tower = _init_component_model(
                         config.audio_tokenizer_config,
                     )
-        else:
-            self.secondary_weights = []
 
         self.image_token_offset = getattr(
             config, "image_token_offset", _DEFAULT_IMAGE_TOKEN_OFFSET
