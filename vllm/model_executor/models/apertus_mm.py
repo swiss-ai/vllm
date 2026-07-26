@@ -1,14 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""
-Multimodal Apertus 1.5 pipeline optimized for native vLLM asynchronous execution.
-
-Architecture Contract:
-1. Processor (CPU): HuggingFace-compatible media preprocessing and prompt
-   expansion. Zero neural network inference is executed here.
-2. Worker (GPU): Native Emu3.5/WavTokenizer execution and O(1) boolean mask
-   ID substitution.
-"""
+"""Apertus 1.5 multimodal model."""
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from math import isqrt
@@ -16,7 +8,12 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import Apertus1p5VisionTokenizerModel, AutoConfig, AutoModel
+from transformers import (
+    Apertus1p5VisionTokenizerModel,
+    AutoConfig,
+    AutoModel,
+    PretrainedConfig,
+)
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import BaseDummyOptions
@@ -47,9 +44,21 @@ from vllm.multimodal.processing import (
 from vllm.sequence import IntermediateTensors
 from vllm.utils.torch_utils import set_default_torch_dtype
 
-from .apertus import ApertusForCausalLM
-from .interfaces import MultiModalEmbeddings, SupportsMultiModal
-from .utils import AutoWeightsLoader, WeightsMapper, maybe_prefix
+from .apertus import ApertusForCausalLM, ApertusModel
+from .interfaces import (
+    MultiModalEmbeddings,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsMultiModal,
+    SupportsPP,
+)
+from .utils import (
+    AutoWeightsLoader,
+    PPMissingLayer,
+    WeightsMapper,
+    maybe_prefix,
+)
 
 _IMAGE_TOKEN_BUDGET_OVERHEAD = 512
 _MAX_AUDIO_SECONDS = 300
@@ -57,8 +66,6 @@ _AUDIO_TOKEN_BUDGET_OVERHEAD = 4
 
 _DEFAULT_IMAGE_PLACEHOLDER = "<|image|>"
 _DEFAULT_BOI_TOKEN = "<|img_start|>"
-_DEFAULT_IMG_TOKEN = "<|img_token_start|>"
-_DEFAULT_EOL_TOKEN = "<|img_end_of_row|>"
 _DEFAULT_EOI_TOKEN = "<|img_end|>"
 _DEFAULT_AUDIO_PLACEHOLDER = "<|audio|>"
 _DEFAULT_AUDIO_START_TOKEN = "<|audio_start|>"
@@ -77,6 +84,7 @@ _DEFAULT_AUDIO_END_TOKEN_ID = 131081
 def _pad_logits_to_input_vocab(
     logits: torch.Tensor, input_vocab_size: int
 ) -> torch.Tensor:
+    # Keep input-only token IDs unsampleable while preserving the expected shape.
     return F.pad(
         logits,
         (0, input_vocab_size - logits.shape[-1]),
@@ -85,10 +93,10 @@ def _pad_logits_to_input_vocab(
 
 
 def _init_component_model(
-    component_config: Mapping[str, Any],
+    component_config: PretrainedConfig,
     model_cls: type[torch.nn.Module] | None = None,
 ) -> torch.nn.Module:
-    config_dict = dict(component_config)
+    config_dict = component_config.to_dict()
     config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
     return AutoModel.from_config(config) if model_cls is None else model_cls(config)
 
@@ -103,15 +111,7 @@ class Apertus1p5ProcessingInfo(BaseProcessingInfo):
         )
 
     def get_default_tok_params(self):
-        """The Apertus chat template renders ``{{ bos_token }}`` itself, so the
-        template owns BOS: when the tokenizer carries a chat template, default
-        tokenization must not add special tokens, or every offline
-        ``LLM.chat()`` prompt starts with a double BOS (``[1, 1, ...]``) --
-        a sequence the model was not trained on (apertus-program #420).
-        Base checkpoints (no chat template) keep the default so raw prompts
-        still get their BOS. Same pattern as vllm-project/vllm#39842 (Gemma 4)
-        and the ovis/ultravox/paligemma overrides.
-        """
+        """Avoid duplicate BOS when a chat template renders it."""
         tokenizer = self.ctx.get_tokenizer()
         has_chat_template = getattr(tokenizer, "chat_template", None) is not None
 
@@ -193,10 +193,8 @@ class Apertus1p5DummyInputsBuilder(BaseDummyInputsBuilder[Apertus1p5ProcessingIn
         }
 
 
-class Apertus1p5MultiModalProcessor(
-    BaseMultiModalProcessor[Apertus1p5ProcessingInfo]
-):
-    """CPU-bound API Processor. Strict YAGNI Rule: NO heavy neural networks run here."""
+class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5ProcessingInfo]):
+    """Process Apertus multimodal inputs on the CPU."""
 
     def __init__(
         self,
@@ -241,9 +239,6 @@ class Apertus1p5MultiModalProcessor(
         hf_processor_mm_kwargs: Mapping[str, object],
     ) -> Mapping[str, MultiModalFieldConfig]:
         """Routes per-item tensors to the GPU Worker's embed_multimodal kwargs."""
-        # The first argument of batched() is the MODALITY
-        # ("image"/"audio"), not the field name -- the engine looks items up
-        # by modality during profiling and scheduling.
         return {
             "pixel_values": MultiModalFieldConfig.batched("image"),
             "audio_values": MultiModalFieldConfig.batched("audio"),
@@ -264,12 +259,7 @@ class Apertus1p5MultiModalProcessor(
 
         tokenization_kwargs = dict(inputs.tokenization_kwargs)
 
-        # A token-id prompt was already tokenized upstream (the renderer applied
-        # add_special_tokens per the request), so the decoded text carries its
-        # BOS as literal text. Re-encoding below must not add another one, or
-        # every multimodal chat request starts ``[1, 1, ...]`` (double BOS,
-        # apertus-program #420). Only Apertus does this decode/re-encode round
-        # trip; the stock BaseMultiModalProcessor never re-tokenizes.
+        # Re-encoding token IDs would add a second BOS when it was added upstream.
         if not isinstance(inputs.prompt, str):
             tokenization_kwargs.setdefault("add_special_tokens", False)
 
@@ -288,7 +278,6 @@ class Apertus1p5MultiModalProcessor(
         )
 
         mm_kwargs: dict[str, torch.Tensor | list[torch.Tensor]] = {}
-        mm_counts: dict[str, int] = {}
 
         with timing_ctx.record("preprocess_apertus"):
             hf_outputs = self.hf_processor(
@@ -310,7 +299,6 @@ class Apertus1p5MultiModalProcessor(
                 )
             ]
             mm_kwargs["pixel_values"] = pixel_values
-            mm_counts["image"] = len(pixel_values)
 
         if num_audios > 0:
             audio_values = [
@@ -321,12 +309,8 @@ class Apertus1p5MultiModalProcessor(
                 )
             ]
             mm_kwargs["audio_values"] = audio_values
-            mm_counts["audio"] = len(audio_values)
 
-        # mm_input() requires mm_hashes and mm_placeholders
-        # since upstream 08a8a4af. Placeholders are one PlaceholderRange per
-        # item spanning its layout tokens, with is_embed marking the positions
-        # the GPU worker overwrites.
+        # Each placeholder range marks the token positions replaced by embeddings.
         with timing_ctx.record("get_mm_hashes"):
             mm_hashes = inputs.get_mm_hashes(self.info.model_id)
 
@@ -338,9 +322,7 @@ class Apertus1p5MultiModalProcessor(
             embed_token_id: int,
             count: int,
         ) -> list[PlaceholderRange]:
-            # Anchor on the atomic start/end special tokens directly in the
-            # prompt ids: unlike re-encoding the layout string standalone,
-            # special tokens cannot merge with surrounding text under BPE.
+            # Search processed IDs so special tokens cannot merge with surrounding text.
             ranges: list[PlaceholderRange] = []
             pos = 0
             for _ in range(count):
@@ -397,20 +379,26 @@ class Apertus1p5MultiModalProcessor(
     info=Apertus1p5ProcessingInfo,
     dummy_inputs=Apertus1p5DummyInputsBuilder,
 )
-class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal):
+class Apertus1p5ForConditionalGeneration(
+    torch.nn.Module,
+    SupportsMultiModal,
+    SupportsLoRA,
+    SupportsPP,
+    SupportsEagle,
+    SupportsEagle3,
+):
     hf_to_vllm_mapper = ApertusForCausalLM.hf_to_vllm_mapper | WeightsMapper(
         orig_to_new_prefix={
-            "model.language_model.": "model.",
+            "model.language_model.": "language_model.",
             "model.vision_tokenizer.": "vision_tower.",
             "model.audio_tokenizer.": "audio_tower.",
         }
     )
 
+    packed_modules_mapping = ApertusForCausalLM.packed_modules_mapping
+    embedding_modules = ApertusForCausalLM.embedding_modules
     allow_patterns_overrides = None
 
-    # Required by vLLM's chat serving to insert the
-    # modality placeholder when flattening OpenAI content parts. Without it
-    # image/audio parts silently vanish from the prompt.
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
         if modality.startswith("image"):
@@ -419,36 +407,47 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
             return _DEFAULT_AUDIO_PLACEHOLDER
         raise ValueError(f"Unsupported modality: {modality}")
 
-    """
-    GPU Worker Domain.
-    Heavy inference executes natively on GPU. Returns embeddings of substituted tokens.
-    """
-
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
-        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        super().__init__()
         config = vllm_config.model_config.hf_config
+        text_config = vllm_config.model_config.hf_text_config
+        self.config = config
 
-        output_vocab_size = getattr(config, "output_vocab_size", config.vocab_size)
-        if output_vocab_size > config.vocab_size:
+        with self._mark_language_model(vllm_config):
+            self.language_model = ApertusModel(
+                vllm_config=vllm_config.with_hf_config(text_config),
+                prefix=maybe_prefix(prefix, "language_model"),
+            )
+        self.make_empty_intermediate_tensors = (
+            self.language_model.make_empty_intermediate_tensors
+        )
+
+        output_vocab_size = (
+            getattr(text_config, "output_vocab_size", None) or text_config.vocab_size
+        )
+        if output_vocab_size > text_config.vocab_size:
             raise ValueError("Output vocabulary cannot exceed input vocabulary.")
-        self._input_vocab_size = config.vocab_size
-        self._should_pad_logits_to_input_vocab = False
-        if (
-            get_pp_group().is_last_rank
-            and not config.tie_word_embeddings
-            and output_vocab_size != config.vocab_size
-        ):
+        self._input_vocab_size = text_config.vocab_size
+        self._should_pad_logits_to_input_vocab = (
+            output_vocab_size != text_config.vocab_size
+        )
+        if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
                 output_vocab_size,
-                config.hidden_size,
+                text_config.hidden_size,
                 quant_config=vllm_config.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if config.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(
+                    self.language_model.embed_tokens
+                )
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
                 output_vocab_size, scale=logit_scale
             )
-            self._should_pad_logits_to_input_vocab = True
+        else:
+            self.lm_head = PPMissingLayer()
 
         self.vision_tower: Any | None = None
         self.audio_tower: Any | None = None
@@ -475,10 +474,10 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         )
 
     def get_language_model(self):
-        return self.model
+        return self.language_model
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
-        logits = super().compute_logits(hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None or not self._should_pad_logits_to_input_vocab:
             return logits
         return _pad_logits_to_input_vocab(logits, self._input_vocab_size)
@@ -491,9 +490,7 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors:
-        # Absorb multimodal kwargs (e.g. pixel_values, etc.) which are
-        # already processed in embed_multimodal
-        return self.model(
+        return self.language_model(
             input_ids,
             positions,
             intermediate_tensors,
@@ -504,7 +501,11 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else []
+        skip_prefixes = (
+            ["lm_head."]
+            if self.config.tie_word_embeddings
+            else []
+        )
         if not get_pp_group().is_first_rank:
             skip_prefixes.extend(["vision_tower.", "audio_tower."])
 
@@ -553,16 +554,18 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         encode_fn: Callable[[torch.Tensor], torch.Tensor],
         device: torch.device,
     ) -> list[torch.Tensor]:
-        """Encodes inputs for a single modality and retrieves their embeddings."""
+        """Encode a modality batch and look up its language embeddings."""
         items = list(values.unbind(0)) if isinstance(values, torch.Tensor) else values
         if not items:
             return []
 
+        # Encode each item independently to preserve HuggingFace parity for image
+        # and audio inputs.
         ids_per_item = [encode_fn(item) for item in items]
         lengths = [ids.shape[0] for ids in ids_per_item]
 
         all_ids = torch.cat(ids_per_item).to(device)
-        all_embeds = super().embed_input_ids(all_ids)
+        all_embeds = self.language_model.embed_input_ids(all_ids)
         return list(all_embeds.split(lengths))
 
     def embed_multimodal(
@@ -577,7 +580,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
 
         multimodal_embeddings: list[torch.Tensor] = []
 
-        # Iterate over keys of kwargs to preserve modality order
         for input_key in kwargs:
             if input_key == "pixel_values":
                 pixel_values = kwargs[input_key]
@@ -608,11 +610,6 @@ class Apertus1p5ForConditionalGeneration(ApertusForCausalLM, SupportsMultiModal)
         is_multimodal: torch.Tensor | None = None,
         **kwargs: object,
     ) -> torch.Tensor:
-        # Route to standard vLLM multi-modal merge.
-        # This takes the text embeddings generated from input_ids and
-        # overwrites the rows corresponding to the dummy placeholders (where
-        # is_multimodal is True) with the high-fidelity visual/audio
-        # embeddings generated in embed_multimodal.
         return SupportsMultiModal.embed_input_ids(
             self,
             input_ids,
