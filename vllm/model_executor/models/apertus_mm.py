@@ -103,9 +103,9 @@ def _init_component_model(
 
 class Apertus1p5ProcessingInfo(BaseProcessingInfo):
     def get_data_parser(self) -> MultiModalDataParser:
-        feature_extractor = self.get_hf_processor().feature_extractor
+        audio_feature_extractor = self.get_hf_processor().feature_extractor
         return MultiModalDataParser(
-            target_sr=feature_extractor.sampling_rate,
+            target_sr=audio_feature_extractor.sampling_rate,
             target_channels=1,
             expected_hidden_size=self._get_expected_hidden_size(),
         )
@@ -117,6 +117,8 @@ class Apertus1p5ProcessingInfo(BaseProcessingInfo):
 
         params = super().get_default_tok_params()
         if has_chat_template:
+            # The template emits BOS itself; suppress tokenizer-added BOS to
+            # avoid sending two BOS tokens to the model.
             params = params.with_kwargs(add_special_tokens=False)
         return params
 
@@ -206,19 +208,20 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
         super().__init__(info, dummy_inputs, cache=cache)
         tokenizer = info.get_tokenizer()
         self.hf_processor = info.get_hf_processor()
+        config = info.get_hf_config()
         self.image_token_id = getattr(
-            tokenizer, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID
+            config, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID
         )
         self.audio_token_id = getattr(
-            tokenizer, "audio_token_id", _DEFAULT_AUDIO_TOKEN_ID
+            config, "audio_token_id", _DEFAULT_AUDIO_TOKEN_ID
         )
         self.image_start_token = getattr(tokenizer, "boi_token", _DEFAULT_BOI_TOKEN)
         self.image_end_token = getattr(tokenizer, "eoi_token", _DEFAULT_EOI_TOKEN)
         self.audio_start_token = getattr(
-            tokenizer, "audio_start_token", _DEFAULT_AUDIO_START_TOKEN
+            tokenizer, "boa_token", _DEFAULT_AUDIO_START_TOKEN
         )
         self.audio_end_token = getattr(
-            tokenizer, "audio_end_token", _DEFAULT_AUDIO_END_TOKEN
+            tokenizer, "eoa_token", _DEFAULT_AUDIO_END_TOKEN
         )
         self.image_start_token_id = getattr(
             tokenizer, "boi_token_id", _DEFAULT_IMAGE_START_TOKEN_ID
@@ -227,10 +230,10 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             tokenizer, "eoi_token_id", _DEFAULT_IMAGE_END_TOKEN_ID
         )
         self.audio_start_token_id = getattr(
-            tokenizer, "audio_start_token_id", _DEFAULT_AUDIO_START_TOKEN_ID
+            tokenizer, "boa_token_id", _DEFAULT_AUDIO_START_TOKEN_ID
         )
         self.audio_end_token_id = getattr(
-            tokenizer, "audio_end_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
+            tokenizer, "eoa_token_id", _DEFAULT_AUDIO_END_TOKEN_ID
         )
 
     def _get_mm_fields_config(
@@ -291,6 +294,8 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             prompt_token_ids = hf_outputs["input_ids"][0].tolist()
 
         if num_images > 0:
+            # Hugging Face pads images in a multimodal batch to a common size.
+            # Crop each item back to its reported dimensions before encoding it.
             pixel_values = [
                 image[:, : int(height), : int(width)].contiguous()
                 for image, (height, width) in zip(
@@ -301,6 +306,8 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             mm_kwargs["pixel_values"] = pixel_values
 
         if num_audios > 0:
+            # Hugging Face pads audio features in a multimodal batch to a common
+            # length. Remove that padding with each item's attention mask.
             audio_values = [
                 audio[0, : int(mask.sum())].contiguous()
                 for audio, mask in zip(
@@ -322,7 +329,15 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             embed_token_id: int,
             count: int,
         ) -> list[PlaceholderRange]:
-            # Search processed IDs so special tokens cannot merge with surrounding text.
+            """Locate processor-created multimodal spans and embedding slots.
+
+            The Hugging Face processor expands images into
+            ``<|img_start|>H*W<|img_token_start|><|image|>...<|img_end|>``
+            and audio into ``<|audio_start|><|audio|>...<|audio_end|>``.
+            For each item, find the next complete range after the previous
+            one and mark its ``<|image|>`` or ``<|audio|>`` positions for
+            replacement with the corresponding encoded embeddings.
+            """
             ranges: list[PlaceholderRange] = []
             pos = 0
             for _ in range(count):
@@ -422,6 +437,9 @@ class Apertus1p5ForConditionalGeneration(
             self.language_model.make_empty_intermediate_tensors
         )
 
+        # `output_vocab_size` is the number of rows in the output LM head. The
+        # pruned head contains text tokens only; image, audio, and omni special
+        # token IDs remain input-only embeddings and cannot be generated.
         output_vocab_size = (
             getattr(text_config, "output_vocab_size", None) or text_config.vocab_size
         )
@@ -439,8 +457,8 @@ class Apertus1p5ForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
             if config.tie_word_embeddings:
-                self.lm_head = self.lm_head.tie_weights(
-                    self.language_model.embed_tokens
+                raise ValueError(
+                    "Apertus 1.5 does not support tied input and output embeddings."
                 )
             logit_scale = getattr(config, "logit_scale", 1.0)
             self.logits_processor = LogitsProcessor(
@@ -480,6 +498,8 @@ class Apertus1p5ForConditionalGeneration(
         logits = self.logits_processor(self.lm_head, hidden_states)
         if logits is None or not self._should_pad_logits_to_input_vocab:
             return logits
+        # The text-only LM head is narrower than the input vocabulary used by
+        # repetition penalties and other sampler logic.
         return _pad_logits_to_input_vocab(logits, self._input_vocab_size)
 
     def forward(
@@ -526,6 +546,8 @@ class Apertus1p5ForConditionalGeneration(
         vision_tower = self.vision_tower
         assert vision_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(vision_tower)
+        # The vision tower expects a single image with a batch dimension;
+        # per-item encoding avoids quality degradation from tokenizer batching.
         image = image.unsqueeze(0).to(device=target_device, dtype=target_dtype)
         with torch.inference_mode():
             valid_codes = vision_tower.encode(image).flatten()
@@ -538,6 +560,8 @@ class Apertus1p5ForConditionalGeneration(
         audio_tower = self.audio_tower
         assert audio_tower is not None
         target_device, target_dtype = self._get_module_device_dtype(audio_tower)
+        # The audio tower expects a single clip with batch/channel dimensions;
+        # per-item encoding avoids quality degradation from tokenizer batching.
         with torch.inference_mode():
             output = audio_tower.encode(
                 audio.unsqueeze(0)
@@ -554,7 +578,7 @@ class Apertus1p5ForConditionalGeneration(
         encode_fn: Callable[[torch.Tensor], torch.Tensor],
         device: torch.device,
     ) -> list[torch.Tensor]:
-        """Encode a modality batch and look up its language embeddings."""
+        """Encode modality items one by one, then batch-lookup their embeddings."""
         items = list(values.unbind(0)) if isinstance(values, torch.Tensor) else values
         if not items:
             return []
