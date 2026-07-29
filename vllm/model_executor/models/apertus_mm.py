@@ -261,10 +261,16 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
         )
 
         tokenization_kwargs = dict(inputs.tokenization_kwargs)
-
-        # Re-encoding token IDs would add a second BOS when it was added upstream.
         if not isinstance(inputs.prompt, str):
-            tokenization_kwargs.setdefault("add_special_tokens", False)
+            # A template-rendered prompt already starts with BOS. Otherwise,
+            # restore the BOS added before token IDs were decoded to text.
+            tokenization_kwargs.setdefault(
+                "add_special_tokens",
+                not (
+                    bool(inputs.prompt)
+                    and inputs.prompt[0] == tokenizer.bos_token_id
+                ),
+            )
 
         num_images = inputs.mm_data_items.get_count("image", strict=False)
         num_audios = inputs.mm_data_items.get_count("audio", strict=False)
