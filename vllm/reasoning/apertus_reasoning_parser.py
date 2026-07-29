@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Reasoning parser for Apertus models.
 
-Apertus wraps its deliberation between a start/end pair of special tokens. The
+Apertus wraps its thinking between a start/end pair of special tokens. The
 canonical pair is ``<|inner_prefix|>``/``<|inner_suffix|>``, but some tokenizer
 builds register ``<think>``/``</think>`` at the emitted ids instead. The parser
 selects whichever pair the loaded tokenizer exposes at the lower start-token id.
@@ -27,7 +27,7 @@ _CANDIDATE_PAIRS = (
 
 @ReasoningParserManager.register_module("apertus")
 class ApertusReasoningParser(BaseThinkingReasoningParser):
-    """Reasoning parser for the Apertus deliberation block."""
+    """Reasoning parser for the Apertus thinking block."""
 
     @cached_property
     def _pair(self) -> tuple[str, str]:
@@ -50,7 +50,7 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
-        # With no deliberation block at all (direct tool call or plain answer),
+        # With no thinking block at all (direct tool call or plain answer),
         # the base class would label the whole output as reasoning, hiding tool
         # calls from the tool parser. Return it as content instead.
         if self.start_token not in model_output and self.end_token not in model_output:
