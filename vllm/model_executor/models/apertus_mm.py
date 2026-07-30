@@ -21,7 +21,6 @@ from vllm.distributed import get_pp_group
 from vllm.inputs import MultiModalDataDict, MultiModalInput, mm_input
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
-from vllm.model_executor.model_loader import DefaultModelLoader
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import (
     MultiModalFieldConfig,
@@ -209,20 +208,14 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
         tokenizer = info.get_tokenizer()
         self.hf_processor = info.get_hf_processor()
         config = info.get_hf_config()
-        self.image_token_id = getattr(
-            config, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID
-        )
-        self.audio_token_id = getattr(
-            config, "audio_token_id", _DEFAULT_AUDIO_TOKEN_ID
-        )
+        self.image_token_id = getattr(config, "image_token_id", _DEFAULT_IMAGE_TOKEN_ID)
+        self.audio_token_id = getattr(config, "audio_token_id", _DEFAULT_AUDIO_TOKEN_ID)
         self.image_start_token = getattr(tokenizer, "boi_token", _DEFAULT_BOI_TOKEN)
         self.image_end_token = getattr(tokenizer, "eoi_token", _DEFAULT_EOI_TOKEN)
         self.audio_start_token = getattr(
             tokenizer, "boa_token", _DEFAULT_AUDIO_START_TOKEN
         )
-        self.audio_end_token = getattr(
-            tokenizer, "eoa_token", _DEFAULT_AUDIO_END_TOKEN
-        )
+        self.audio_end_token = getattr(tokenizer, "eoa_token", _DEFAULT_AUDIO_END_TOKEN)
         self.image_start_token_id = getattr(
             tokenizer, "boi_token_id", _DEFAULT_IMAGE_START_TOKEN_ID
         )
@@ -267,8 +260,7 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             tokenization_kwargs.setdefault(
                 "add_special_tokens",
                 not (
-                    bool(inputs.prompt)
-                    and inputs.prompt[0] == tokenizer.bos_token_id
+                    bool(inputs.prompt) and inputs.prompt[0] == tokenizer.bos_token_id
                 ),
             )
 
@@ -527,11 +519,7 @@ class Apertus1p5ForConditionalGeneration(
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        skip_prefixes = (
-            ["lm_head."]
-            if self.config.tie_word_embeddings
-            else []
-        )
+        skip_prefixes = ["lm_head."] if self.config.tie_word_embeddings else []
         if not get_pp_group().is_first_rank:
             skip_prefixes.extend(["vision_tower.", "audio_tower."])
 

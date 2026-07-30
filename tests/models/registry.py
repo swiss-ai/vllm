@@ -767,6 +767,11 @@ _AUTOMATIC_CONVERTED_MODELS = {
 
 _MULTIMODAL_EXAMPLE_MODELS = {
     # [Decoder-only]
+    "Apertus1p5ForConditionalGeneration": _HfExamplesInfo(
+        "swiss-ai/Apertus-v1.5-8B",
+        # TODO: Update to the latest released Transformers version.
+        min_transformers_version="5.14",
+    ),
     "AriaForConditionalGeneration": _HfExamplesInfo("rhymes-ai/Aria"),
     "AudioFlamingo3ForConditionalGeneration": _HfExamplesInfo(
         "nvidia/audio-flamingo-3-hf",
@@ -774,10 +779,6 @@ _MULTIMODAL_EXAMPLE_MODELS = {
         transformers_version_reason={
             "vllm": "Needs https://github.com/huggingface/transformers/pull/43538"
         },
-    ),
-    "Apertus1p5ForConditionalGeneration": _HfExamplesInfo(
-        "swiss-ai/Apertus-v1.5-8B",
-        min_transformers_version="5.14",        # TODO: Update to the latest released Transformers version.
     ),
     "BagelForConditionalGeneration": _HfExamplesInfo("ByteDance-Seed/BAGEL-7B-MoT"),
     "BeeForConditionalGeneration": _HfExamplesInfo(

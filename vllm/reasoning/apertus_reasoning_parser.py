@@ -11,7 +11,6 @@ selects whichever pair the loaded tokenizer exposes at the lower start-token id.
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from vllm.reasoning import ReasoningParserManager
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
 
 if TYPE_CHECKING:
@@ -25,7 +24,6 @@ _CANDIDATE_PAIRS = (
 )
 
 
-@ReasoningParserManager.register_module("apertus")
 class ApertusReasoningParser(BaseThinkingReasoningParser):
     """Reasoning parser for the Apertus thinking block."""
 
