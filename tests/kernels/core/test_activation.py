@@ -18,8 +18,10 @@ from vllm.model_executor.layers.activation import (
     ReLUSquaredActivation,
     SiluAndMul,
     SiluAndMulWithClamp,
+    SSSGLUAndMul,
     SwigluOAIAndMul,
     SwigluStepAndMul,
+    sssglu_and_mul_triton,
     swiglustep_and_mul_triton,
 )
 from vllm.utils.torch_utils import set_random_seed
@@ -116,6 +118,198 @@ def test_act_and_mul(
         opcheck(fn, (out, x, layer.alpha, layer.limit))
     elif activation != "swiglustep_and_mul":
         opcheck(fn, (out, x))
+
+
+def _sssglu_and_mul_reference(x: torch.Tensor) -> torch.Tensor:
+    gate, up = x.chunk(2, dim=-1)
+    gate = gate.float()
+    up = up.float()
+    shifted_gate = gate - 1.0
+    output = (0.5 + shifted_gate / (1.0 + shifted_gate.abs())) * up
+    return output.to(x.dtype)
+
+
+SSSGLU_AND_MUL_IMPLEMENTATIONS = ["native", "triton_wrapper", "custom_op"]
+
+
+def _run_sssglu_and_mul(
+    x: torch.Tensor,
+    implementation: str,
+    default_vllm_config,
+) -> torch.Tensor:
+    if implementation == "native":
+        return SSSGLUAndMul().forward_native(x)
+
+    if implementation == "triton_wrapper":
+        d = x.shape[-1] // 2
+        output = torch.empty(
+            x.shape[:-1] + (d,),
+            dtype=x.dtype,
+            device=x.device,
+        )
+        sssglu_and_mul_triton(output, x)
+        return output
+
+    assert implementation == "custom_op"
+    default_vllm_config.compilation_config.custom_ops = ["all"]
+    return SSSGLUAndMul()(x)
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "num_tokens,d",
+    [
+        (1, 7),
+        (7, 576),
+        (3, 1024),
+        (2, 2048),
+    ],
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul(
+    default_vllm_config,
+    implementation: str,
+    dtype: torch.dtype,
+    num_tokens: int,
+    d: int,
+    device: str,
+) -> None:
+    set_random_seed(0)
+    x = torch.randn((num_tokens, 2 * d), dtype=dtype, device=device)
+
+    anchors = torch.tensor(
+        [-1000.0, 0.0, 0.96875, 1.0, 1.03125, 2.0, 1000.0],
+        dtype=dtype,
+        device=device,
+    )
+    num_anchors = min(d, anchors.numel())
+    x[0, :num_anchors] = anchors[:num_anchors]
+    x[0, d : d + num_anchors] = torch.arange(
+        1,
+        num_anchors + 1,
+        dtype=dtype,
+        device=device,
+    )
+
+    expected = _sssglu_and_mul_reference(x)
+    output = _run_sssglu_and_mul(x, implementation, default_vllm_config)
+
+    if dtype == torch.bfloat16:
+        atol, rtol = 2.0e-2, 2.0e-2
+    else:
+        atol, rtol = 1.0e-5, 1.0e-4
+
+    assert output.shape == expected.shape
+    assert output.dtype == dtype
+    torch.testing.assert_close(output, expected, atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_bf16_cast_boundary(
+    default_vllm_config,
+    implementation: str,
+    device: str,
+) -> None:
+    gate = torch.tensor(
+        [-1.0, -0.0009765625, 0.5, 0.99609375, 1.5, 1.9921875, 3.0],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    up = torch.tensor(
+        [-8.0, -8.0, -8.0, -3.0, -8.0, -8.0, -8.0],
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    x = torch.cat((gate, up)).unsqueeze(0)
+
+    expected = _sssglu_and_mul_reference(x)
+    shifted_gate = gate - 1.0
+    premature_cast = (
+        0.5 + shifted_gate / (1.0 + shifted_gate.abs())
+    ) * up
+    assert not torch.equal(premature_cast, expected[0])
+
+    output = _run_sssglu_and_mul(x, implementation, default_vllm_config)
+    torch.testing.assert_close(output, expected, atol=0.0, rtol=0.0)
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_zero_tokens(
+    default_vllm_config,
+    implementation: str,
+    device: str,
+) -> None:
+    d = 576
+    x = torch.empty((0, 2 * d), dtype=torch.bfloat16, device=device)
+
+    output = _run_sssglu_and_mul(x, implementation, default_vllm_config)
+    assert output.shape == (0, d)
+    assert output.dtype == x.dtype
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_3d(
+    default_vllm_config,
+    implementation: str,
+    device: str,
+) -> None:
+    d = 17
+    x = torch.randn(
+        (2, 3, 2 * d),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+
+    expected = _sssglu_and_mul_reference(x)
+    output = _run_sssglu_and_mul(x, implementation, default_vllm_config)
+
+    assert output.shape == (2, 3, d)
+    assert output.dtype == x.dtype
+    torch.testing.assert_close(output, expected, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_noncontiguous(
+    default_vllm_config,
+    implementation: str,
+    device: str,
+) -> None:
+    d = 17
+    storage = torch.randn((6, 4 * d), dtype=torch.bfloat16, device=device)
+    x = storage[:, ::2]
+    assert x.shape == (6, 2 * d)
+    assert not x.is_contiguous()
+
+    expected = _sssglu_and_mul_reference(x)
+    output = _run_sssglu_and_mul(x, implementation, default_vllm_config)
+
+    assert output.shape == (6, d)
+    assert output.dtype == x.dtype
+    torch.testing.assert_close(output, expected, atol=2.0e-2, rtol=2.0e-2)
+
+
+@pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_rejects_odd_dimension(
+    default_vllm_config,
+    implementation: str,
+    device: str,
+) -> None:
+    x = torch.randn((3, 11), dtype=torch.float32, device=device)
+
+    with pytest.raises(ValueError):
+        _run_sssglu_and_mul(x, implementation, default_vllm_config)
 
 
 SWIGLU_LIMITS = [3.0, 7.0, 15.0]
