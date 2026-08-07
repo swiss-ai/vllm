@@ -24,6 +24,7 @@ class MoEActivation(Enum):
     SWIGLUOAI = "swigluoai"
     SWIGLUOAI_UNINTERLEAVE = "swigluoai_uninterleave"
     SWIGLUSTEP = "swiglustep"
+    SSSGLU = "sssglu"
 
     # Non-gated activations (no mul with gate) expect input of shape [..., d]
     # and produce output of shape [..., d].
@@ -85,6 +86,7 @@ _CUSTOM_OP_NAMES: dict[MoEActivation, str] = {
     MoEActivation.GELU_NO_MUL: "gelu_and_mul",
     MoEActivation.GELU_TANH_NO_MUL: "gelu_tanh_and_mul",
     MoEActivation.RELU2_NO_MUL: "relu2",
+    MoEActivation.SSSGLU: "sssglu_and_mul",
 }
 
 _WITHOUT_MUL: dict[MoEActivation, MoEActivation] = {
@@ -173,6 +175,10 @@ def apply_moe_activation(
         from vllm.model_executor.layers.activation import swiglustep_and_mul_triton
 
         swiglustep_and_mul_triton(output, input)
+    elif activation == MoEActivation.SSSGLU:
+        from vllm.model_executor.layers.activation import sssglu_and_mul_triton
+
+        sssglu_and_mul_triton(output, input)
 
     # Activations without gated multiplication
     elif activation == MoEActivation.SILU_NO_MUL:

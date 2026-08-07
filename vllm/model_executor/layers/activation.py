@@ -74,6 +74,55 @@ def swiglustep_and_mul_triton(
     )
 
 
+@triton.jit
+def _sssglu_and_mul_kernel(
+    o_ptr,
+    o_stride,
+    x_ptr,
+    x_stride,
+    d: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+) -> None:
+    i = tl.program_id(axis=0).to(tl.int64)
+    j = tl.program_id(axis=1)
+    o_row_ptr = o_ptr + o_stride * i
+    x_row_ptr = x_ptr + x_stride * i
+    offsets = j * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < d
+
+    gate = tl.load(x_row_ptr + offsets, mask=mask).to(tl.float32)
+    up = tl.load(x_row_ptr + offsets + d, mask=mask).to(tl.float32)
+
+    u = gate - 1.0
+    gate_sssglu = 0.5 + u / (1.0 + tl.abs(u))
+
+    result = gate_sssglu * up
+    result = result.to(x_ptr.dtype.element_ty)
+    tl.store(o_row_ptr + offsets, result, mask=mask)
+
+
+def sssglu_and_mul_triton(output: torch.Tensor, input: torch.Tensor) -> None:
+    n = input.shape[-1]
+    if n % 2 != 0:
+        raise ValueError(f"SSSGLU requires an even final dimension, got {n}")
+    d = n // 2
+    num_rows = input.numel() // n
+
+    input2d = input.contiguous().view(num_rows, n)
+    output2d = output.view(num_rows, d)
+
+    def grid(meta):
+        return (num_rows, triton.cdiv(d, meta["BLOCK_SIZE"]))
+
+    _sssglu_and_mul_kernel[grid](
+        output2d,
+        output2d.stride(0),
+        input2d,
+        input2d.stride(0),
+        d=d,
+        BLOCK_SIZE=1024,
+    )
+
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
 class FatreluAndMul(CustomOp):
@@ -504,6 +553,39 @@ class SwigluStepAndMul(CustomOp):
 
     def extra_repr(self) -> str:
         return f"limit={repr(self.limit)}"
+
+
+@CustomOp.register("sssglu_and_mul")
+class SSSGLUAndMul(CustomOp):
+    """An SSSGLU activation and multiplication function.
+
+    Computes x -> (softsign(x[:d] - 1) + 0.5) * x[d:]
+    where d = x.shape[-1] // 2.
+
+    Shapes:
+        x: (num_tokens, 2 * d) or (batch_size, seq_len, 2 * d)
+        return: (num_tokens, d) or (batch_size, seq_len, d)
+    """
+
+    def __init__(self):
+        super().__init__()
+
+    def forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        """PyTorch-native implementation equivalent to forward()."""
+        if x.shape[-1] % 2 != 0:
+            raise ValueError(
+                f"SSSGLU requires an even final dimension, got {x.shape[-1]}"
+            )
+        gate, up = x.chunk(2, dim=-1)
+        output = (F.softsign(gate - 1.0) + 0.5) * up
+        return output
+
+    def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
+        d = x.shape[-1] // 2
+        output_shape = x.shape[:-1] + (d,)
+        out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
+        sssglu_and_mul_triton(out, x)
+        return out
 
 
 # --8<-- [start:gelu_new]

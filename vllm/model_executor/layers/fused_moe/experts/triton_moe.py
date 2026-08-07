@@ -132,6 +132,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             MoEActivation.GELU_NO_MUL,
             MoEActivation.GELU_TANH_NO_MUL,
             MoEActivation.RELU2_NO_MUL,
+            MoEActivation.SSSGLU,
         ]
 
     @staticmethod
