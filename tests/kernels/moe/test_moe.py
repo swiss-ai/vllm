@@ -142,9 +142,7 @@ def _sssglu_fused_moe_reference(
             packed = F.linear(token, w1[expert_idx])
             gate, up = packed.chunk(2, dim=-1)
             shifted_gate = gate.float() - 1.0
-            activated = (
-                0.5 + shifted_gate / (1.0 + shifted_gate.abs())
-            ) * up.float()
+            activated = (0.5 + shifted_gate / (1.0 + shifted_gate.abs())) * up.float()
             activated = activated.to(hidden_states.dtype)
             expert_output = F.linear(activated, w2[expert_idx])
             route_weight = topk_weights[token_idx, route_idx]
@@ -462,16 +460,22 @@ def test_unquantized_triton_fused_moe_executes_exact_sssglu(
     hidden_states = (
         torch.randn((num_tokens, hidden_size), device="cuda", dtype=dtype) / 10
     )
-    w1 = torch.randn(
-        (num_experts, 2 * intermediate_size, hidden_size),
-        device="cuda",
-        dtype=dtype,
-    ) / 10
-    w2 = torch.randn(
-        (num_experts, hidden_size, intermediate_size),
-        device="cuda",
-        dtype=dtype,
-    ) / 10
+    w1 = (
+        torch.randn(
+            (num_experts, 2 * intermediate_size, hidden_size),
+            device="cuda",
+            dtype=dtype,
+        )
+        / 10
+    )
+    w2 = (
+        torch.randn(
+            (num_experts, hidden_size, intermediate_size),
+            device="cuda",
+            dtype=dtype,
+        )
+        / 10
+    )
     topk_ids = torch.tensor(
         [[0, 1], [1, 2], [2, 0], [0, 2], [1, 0]],
         dtype=torch.int32,

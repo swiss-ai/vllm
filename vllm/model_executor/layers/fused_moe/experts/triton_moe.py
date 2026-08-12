@@ -144,6 +144,7 @@ class TritonExperts(LoRAExpertsMixin, mk.FusedMoEExpertsModular):
             MoEActivation.SWIGLUOAI,
             MoEActivation.SWIGLUOAI_UNINTERLEAVE,
             MoEActivation.SWIGLUSTEP,
+            MoEActivation.SSSGLU,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
             MoEActivation.GELU_TANH_NO_MUL,

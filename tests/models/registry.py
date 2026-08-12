@@ -201,6 +201,13 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
     # [Decoder-only]
     "AfmoeForCausalLM": _HfExamplesInfo("arcee-ai/Trinity-Nano-Preview"),
     "ApertusForCausalLM": _HfExamplesInfo("swiss-ai/Apertus-8B-Instruct-2509"),
+    # No public Apertus2 checkpoint is available yet.
+    "Apertus2ForCausalLM": _HfExamplesInfo(
+        "swiss-ai/Apertus2",
+        dtype="bfloat16",
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "ArceeForCausalLM": _HfExamplesInfo("arcee-ai/AFM-4.5B-Base"),
     "ArcticForCausalLM": _HfExamplesInfo("Snowflake/snowflake-arctic-instruct"),
     "AXK1ForCausalLM": _HfExamplesInfo("skt/A.X-K1", trust_remote_code=True),
