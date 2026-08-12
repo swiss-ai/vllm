@@ -137,22 +137,23 @@ def _run_sssglu_and_mul(
     implementation: str,
     default_vllm_config,
 ) -> torch.Tensor:
-    if implementation == "native":
-        return SSSGLUAndMul().forward_native(x)
+    with torch.cuda.device(x.device):
+        if implementation == "native":
+            return SSSGLUAndMul().forward_native(x)
 
-    if implementation == "triton_wrapper":
-        d = x.shape[-1] // 2
-        output = torch.empty(
-            x.shape[:-1] + (d,),
-            dtype=x.dtype,
-            device=x.device,
-        )
-        sssglu_and_mul_triton(output, x)
-        return output
+        if implementation == "triton_wrapper":
+            d = x.shape[-1] // 2
+            output = torch.empty(
+                x.shape[:-1] + (d,),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            sssglu_and_mul_triton(output, x)
+            return output
 
-    assert implementation == "custom_op"
-    default_vllm_config.compilation_config.custom_ops = ["all"]
-    return SSSGLUAndMul()(x)
+        assert implementation == "custom_op"
+        default_vllm_config.compilation_config.custom_ops = ["all"]
+        return SSSGLUAndMul()(x)
 
 
 @pytest.mark.parametrize("implementation", SSSGLU_AND_MUL_IMPLEMENTATIONS)
@@ -310,6 +311,76 @@ def test_sssglu_and_mul_rejects_odd_dimension(
 
     with pytest.raises(ValueError):
         _run_sssglu_and_mul(x, implementation, default_vllm_config)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_torch_compile_fullgraph(
+    default_vllm_config,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    torch._dynamo.reset()
+    x = torch.randn((7, 2 * 127), dtype=dtype, device=device)
+    x_before = x.clone()
+    operation = SSSGLUAndMul()
+    compiled_native = torch.compile(
+        operation.forward_native,
+        backend="inductor",
+        fullgraph=True,
+    )
+
+    output = compiled_native(x)
+    expected = _sssglu_and_mul_reference(x)
+
+    tolerance = 2.0e-2 if dtype == torch.bfloat16 else 1.0e-5
+    torch.testing.assert_close(
+        output,
+        expected,
+        atol=tolerance,
+        rtol=tolerance,
+    )
+    torch.testing.assert_close(x, x_before, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_sssglu_and_mul_cuda_graph_replay(
+    default_vllm_config,
+    dtype: torch.dtype,
+    device: str,
+) -> None:
+    with torch.cuda.device(device):
+        static_input = torch.randn((7, 2 * 127), dtype=dtype, device=device)
+        operation = SSSGLUAndMul()
+        operation.forward_cuda(static_input)
+        torch.cuda.synchronize(device)
+
+        graph = torch.cuda.CUDAGraph()
+        capture_stream = torch.cuda.Stream()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            graph_output = operation.forward_cuda(static_input)
+        torch.cuda.synchronize(device)
+
+        for offset in (0.0, 0.625):
+            next_input = torch.randn_like(static_input) + offset
+            static_input.copy_(next_input)
+            input_before = static_input.clone()
+            expected = _sssglu_and_mul_reference(static_input)
+
+            graph.replay()
+            torch.cuda.synchronize(device)
+
+            tolerance = 2.0e-2 if dtype == torch.bfloat16 else 1.0e-5
+            torch.testing.assert_close(
+                graph_output,
+                expected,
+                atol=tolerance,
+                rtol=tolerance,
+            )
+            torch.testing.assert_close(static_input, input_before, atol=0, rtol=0)
 
 
 SWIGLU_LIMITS = [3.0, 7.0, 15.0]
