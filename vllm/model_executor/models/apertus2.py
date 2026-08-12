@@ -136,12 +136,11 @@ class Apertus2MLP(nn.Module):
         )
         if hidden_act != "sssglu":
             raise ValueError(
-                f"Unsupported activation: {hidden_act}. "
-                "Only sssglu is supported."
+                f"Unsupported activation: {hidden_act}. Only sssglu is supported."
             )
         self.act_fn = SSSGLUAndMul()
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -329,9 +328,9 @@ class Apertus2Attention(nn.Module):
         )
 
         sliding_window = None
-        if layer_types := getattr(config, "layer_types", None):
-            if layer_types[layer_idx] == "sliding_attention":
-                sliding_window = config.sliding_window
+        layer_types = getattr(config, "layer_types", None)
+        if layer_types and layer_types[layer_idx] == "sliding_attention":
+            sliding_window = config.sliding_window
 
         self.attn = Attention(
             self.num_heads,
@@ -547,6 +546,11 @@ class Apertus2Model(nn.Module):
 
 class Apertus2ForCausalLM(nn.Module, SupportsPP):
     """Minimal native vLLM wrapper for Apertus 2 causal generation."""
+
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_stacked={

@@ -100,6 +100,8 @@ def sssglu_and_mul_triton(output: torch.Tensor, input: torch.Tensor) -> None:
     if n % 2 != 0:
         raise ValueError(f"SSSGLU requires an even final dimension, got {n}")
     d = n // 2
+    if input.numel() == 0:
+        return
     num_rows = input.numel() // n
 
     input2d = input.contiguous().view(num_rows, n)
@@ -116,6 +118,7 @@ def sssglu_and_mul_triton(output: torch.Tensor, input: torch.Tensor) -> None:
         d=d,
         BLOCK_SIZE=1024,
     )
+
 
 # --8<-- [start:fatrelu_and_mul]
 @CustomOp.register("fatrelu_and_mul")
