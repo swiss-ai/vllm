@@ -41,6 +41,7 @@ from vllm.model_executor.layers.fused_moe.experts.marlin_moe import (
     batched_fused_marlin_moe,
     fused_marlin_moe,
 )
+from vllm.model_executor.layers.fused_moe.experts.triton_moe import TritonExperts
 from vllm.model_executor.layers.fused_moe.utils import (
     moe_use_td_hw_supported,
 )
@@ -123,6 +124,38 @@ def iterative_moe(
             final_hidden_states = final_hidden_states + current_hidden_states
 
     return final_hidden_states.view(orig_shape)  # type: ignore
+
+
+def _sssglu_fused_moe_reference(
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+) -> torch.Tensor:
+    num_tokens = hidden_states.shape[0]
+    output = torch.zeros(
+        (num_tokens, hidden_states.shape[1]),
+        dtype=torch.float32,
+        device=hidden_states.device,
+    )
+
+    for token_idx in range(num_tokens):
+        token = hidden_states[token_idx : token_idx + 1]
+        for route_idx in range(topk_ids.shape[1]):
+            expert_idx = int(topk_ids[token_idx, route_idx].item())
+            packed = F.linear(token, w1[expert_idx])
+            gate, up = packed.chunk(2, dim=-1)
+            shifted_gate = gate.float() - 1.0
+            activated = (
+                0.5 + shifted_gate / (1.0 + shifted_gate.abs())
+            ) * up.float()
+            activated = activated.to(hidden_states.dtype)
+            expert_output = F.linear(activated, w2[expert_idx])
+            route_weight = topk_weights[token_idx, route_idx]
+            output[token_idx].add_(expert_output[0].float() * route_weight)
+
+    return output.to(hidden_states.dtype)
 
 
 NUM_EXPERTS = [8, 64, 192]
@@ -416,6 +449,83 @@ def test_fused_moe(
             use_compile=use_compile,
             use_cudagraph=use_cudagraph,
         )
+
+
+@pytest.mark.skipif(not current_platform.is_cuda(), reason="Requires CUDA")
+@torch.inference_mode()
+def test_unquantized_triton_fused_moe_executes_exact_sssglu(
+    workspace_init,
+) -> None:
+    set_random_seed(11)
+    num_tokens = 5
+    hidden_size = 64
+    intermediate_size = 64
+    num_experts = 4
+    top_k = 2
+    dtype = torch.bfloat16
+
+    hidden_states = (
+        torch.randn((num_tokens, hidden_size), device="cuda", dtype=dtype) / 10
+    )
+    w1 = torch.randn(
+        (num_experts, 2 * intermediate_size, hidden_size),
+        device="cuda",
+        dtype=dtype,
+    ) / 10
+    w2 = torch.randn(
+        (num_experts, hidden_size, intermediate_size),
+        device="cuda",
+        dtype=dtype,
+    ) / 10
+    topk_ids = torch.tensor(
+        [[0, 1], [1, 2], [2, 0], [0, 2], [1, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    topk_weights = torch.tensor(
+        [[0.75, 0.25], [0.60, 0.40], [0.20, 0.80], [0.90, 0.10], [0.35, 0.65]],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    assert not torch.any(topk_ids == 3)
+
+    moe_config = make_dummy_moe_config(
+        num_experts=num_experts,
+        num_local_experts=num_experts,
+        experts_per_token=top_k,
+        hidden_dim=hidden_size,
+        intermediate_size=intermediate_size,
+        in_dtype=dtype,
+        max_num_tokens=8,
+        activation=MoEActivation.SSSGLU,
+    )
+
+    with set_current_vllm_config(vllm_config):
+        kernel = modular_triton_fused_moe(
+            moe_config,
+            FUSED_MOE_UNQUANTIZED_CONFIG,
+        )
+        assert isinstance(kernel.fused_experts, TritonExperts)
+        actual = kernel.apply(
+            hidden_states,
+            w1,
+            w2,
+            topk_weights,
+            topk_ids,
+            activation=MoEActivation.SSSGLU,
+            global_num_experts=num_experts,
+            expert_map=None,
+            apply_router_weight_on_input=False,
+        )
+
+    expected = _sssglu_fused_moe_reference(
+        hidden_states,
+        w1,
+        w2,
+        topk_weights,
+        topk_ids,
+    )
+    torch.testing.assert_close(actual, expected, atol=5e-2, rtol=2e-2)
 
 
 def test_fused_moe_int64_overflow(workspace_init):
