@@ -845,12 +845,16 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
                 MoEActivation.GELU,
                 MoEActivation.GELU_TANH,
                 MoEActivation.SWIGLUOAI,
+                MoEActivation.SSSGLU,
                 MoEActivation.SILU_NO_MUL,
                 MoEActivation.GELU_NO_MUL,
                 MoEActivation.GELU_TANH_NO_MUL,
                 MoEActivation.RELU2_NO_MUL,
             ]
-        return apply_moe_activation_masked_supported(activation)
+        return (
+            apply_moe_activation_masked_supported(activation)
+            or activation == MoEActivation.SSSGLU
+        )
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -986,7 +990,10 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
         intermediate_cache2.fill_(0)
 
         # TODO (bnell): use triton utility from batched deep gemm.
-        if current_platform.is_xpu():
+        # SSSGLU has no masked kernel; padded rows are ignored downstream.
+        if current_platform.is_xpu() or not apply_moe_activation_masked_supported(
+            activation
+        ):
             self.activation(
                 activation,
                 intermediate_cache2.view(-1, activation_out_dim),

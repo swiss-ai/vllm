@@ -132,6 +132,7 @@ def batched_moe(
     per_act_token_quant: bool = False,
     block_shape: list[int] | None = None,
     moe_config: FusedMoEConfig | None = None,
+    activation: MoEActivation = MoEActivation.SILU,
 ) -> torch.Tensor:
     max_num_tokens = round_up(a.shape[0], 64)
 
@@ -146,7 +147,7 @@ def batched_moe(
     )
 
     if moe_config is None:
-        moe_config = make_dummy_moe_config()
+        moe_config = make_dummy_moe_config(activation=activation)
 
     fused_experts = FusedMoEKernel(
         BatchedPrepareAndFinalize(
