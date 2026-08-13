@@ -842,6 +842,7 @@ class BatchedTritonExperts(mk.FusedMoEExpertsModular):
             MoEActivation.GELU,
             MoEActivation.GELU_TANH,
             MoEActivation.SWIGLUOAI,
+            MoEActivation.SSSGLU,
             MoEActivation.SILU_NO_MUL,
             MoEActivation.GELU_NO_MUL,
             MoEActivation.GELU_TANH_NO_MUL,
