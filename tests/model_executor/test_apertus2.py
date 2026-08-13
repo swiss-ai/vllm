@@ -228,6 +228,18 @@ class _OutputProjection(nn.Module):
         return hidden_states, None
 
 
+class _ZeroGateProjection(nn.Module):
+    def __init__(self, input_size: int, output_size: int, **kwargs) -> None:
+        super().__init__()
+        del kwargs
+        self.input_size = input_size
+        self.output_size = output_size
+
+    def forward(self, hidden_states: torch.Tensor):
+        gate = hidden_states.new_zeros(hidden_states.shape[0], self.output_size)
+        return gate, None
+
+
 class _RecordingNorm(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
@@ -264,6 +276,7 @@ class _RecordingAttention(nn.Module):
 def stub_apertus2_attention(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(apertus2, "get_tensor_model_parallel_world_size", lambda: 1)
     monkeypatch.setattr(apertus2, "QKVParallelLinear", _QKVProjection)
+    monkeypatch.setattr(apertus2, "ColumnParallelLinear", _ZeroGateProjection)
     monkeypatch.setattr(apertus2, "RowParallelLinear", _OutputProjection)
     monkeypatch.setattr(apertus2, "RMSNorm", _RecordingNorm)
     monkeypatch.setattr(apertus2, "Attention", _RecordingAttention)
@@ -312,6 +325,59 @@ def test_apertus2_attention_schedules_are_independent(
     assert attention.rotary_emb.calls == int(expected_rope)
 
 
+def test_apertus2_attention_output_gate_defaults_off(
+    stub_apertus2_attention: None,
+) -> None:
+    config = SimpleNamespace(
+        head_dim=4,
+        rms_norm_eps=1e-5,
+        rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+    )
+    attention = Apertus2Attention(
+        config=config,
+        hidden_size=8,
+        num_heads=2,
+        num_kv_heads=1,
+        prefix="model.layers.0.self_attn",
+    )
+
+    assert attention.attention_output_gate is False
+    assert not hasattr(attention, "g_proj")
+
+
+def test_apertus2_attention_zero_gate_halves_pre_o_proj_output(
+    stub_apertus2_attention: None,
+) -> None:
+    def build(attention_output_gate: bool) -> Apertus2Attention:
+        config = SimpleNamespace(
+            head_dim=4,
+            rms_norm_eps=1e-5,
+            rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+            attention_output_gate=attention_output_gate,
+        )
+        return Apertus2Attention(
+            config=config,
+            hidden_size=8,
+            num_heads=2,
+            num_kv_heads=1,
+            prefix="model.layers.0.self_attn",
+        )
+
+    ungated = build(False)
+    gated = build(True)
+    assert gated.g_proj.input_size == 8
+    assert gated.g_proj.output_size == 2 * 4
+
+    positions = torch.arange(2)
+    hidden_states = torch.ones(2, 8, dtype=torch.bfloat16)
+    baseline = ungated(positions, hidden_states)
+    gated_output = gated(positions, hidden_states)
+
+    # sigmoid(0) = 0.5, and the stubbed o_proj is the identity.
+    torch.testing.assert_close(gated_output, 0.5 * baseline)
+    assert gated_output.dtype == hidden_states.dtype
+
+
 def _model_vllm_config(
     *,
     quant_config=None,
@@ -354,6 +420,7 @@ def test_apertus2_model_rejects_unsupported_modes(config, message: str) -> None:
         ("self_attn.q_proj.weight", "self_attn.qkv_proj.weight", "q"),
         ("self_attn.k_proj.weight", "self_attn.qkv_proj.weight", "k"),
         ("self_attn.v_proj.weight", "self_attn.qkv_proj.weight", "v"),
+        ("self_attn.g_proj.weight", "self_attn.g_proj.weight", None),
         ("mlp.gate_proj.weight", "mlp.gate_up_proj.weight", 0),
         ("mlp.up_proj.weight", "mlp.gate_up_proj.weight", 1),
         (
