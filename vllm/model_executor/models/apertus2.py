@@ -16,6 +16,7 @@ from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
@@ -262,7 +263,11 @@ class Apertus2MoE(nn.Module):
 
 
 class Apertus2Attention(nn.Module):
-    """Apertus 2 attention with independent RoPE and window schedules."""
+    """Apertus 2 attention with independent RoPE and window schedules.
+
+    With ``attention_output_gate``, an extra head-sharded projection of the
+    block input gates the attention output channelwise before ``o_proj``.
+    """
 
     def __init__(
         self,
@@ -320,6 +325,21 @@ class Apertus2Attention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
+        # Per-channel sigmoid gate on the attention output, projected from the
+        # same normalized input as Q/K/V. Rows are in global head order, so
+        # column-parallel sharding aligns each rank's gate channels with its
+        # local query heads. Never q-normalized or rotated.
+        self.attention_output_gate = getattr(config, "attention_output_gate", False)
+        if self.attention_output_gate:
+            self.g_proj = ColumnParallelLinear(
+                input_size=hidden_size,
+                output_size=self.total_num_heads * self.head_dim,
+                bias=bias,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.g_proj",
+            )
+
         self.rotary_emb = get_rope(
             self.head_dim,
             max_position=self.max_position_embeddings,
@@ -358,6 +378,11 @@ class Apertus2Attention(nn.Module):
         if self.use_rope:
             q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        if self.attention_output_gate:
+            gate, _ = self.g_proj(hidden_states)
+            attn_output = (attn_output * torch.sigmoid(gate.float())).to(
+                attn_output.dtype
+            )
         output, _ = self.o_proj(attn_output)
         return output
 
