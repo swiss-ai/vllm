@@ -8,6 +8,7 @@ through its ``normalizer``, which runs on the encode path; the emitted ids alway
 detokenize to ``<|inner_*|>``, so only that pair delimits generated reasoning.
 """
 
+from collections.abc import Iterable, Sequence
 from typing import TYPE_CHECKING
 
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
@@ -37,3 +38,14 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
         if self.start_token not in model_output and self.end_token not in model_output:
             return None, model_output
         return super().extract_reasoning(model_output, request)
+
+    def is_reasoning_end_streaming(
+        self, input_ids: Sequence[int], delta_ids: Iterable[int]
+    ) -> bool:
+        if super().is_reasoning_end_streaming(input_ids, delta_ids):
+            return True
+        # The base class only leaves the reasoning phase on the end token, which
+        # never arrives when the model answers or calls a tool without thinking.
+        # Nothing closes a block that was never opened, so end the phase now;
+        # otherwise the tool parser never runs on the stream.
+        return self.start_token_id not in input_ids
