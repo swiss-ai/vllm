@@ -16,7 +16,9 @@ from tests.kernels.quant_utils import native_batched_masked_quant_matmul
 from tests.kernels.utils import torch_experts
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.model_executor.layers.fused_moe import fused_topk
+from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.fused_moe.experts.fused_batched_moe import (
+    BatchedTritonExperts,
     invoke_moe_batched_triton_kernel,
 )
 from vllm.platforms import current_platform
@@ -521,6 +523,46 @@ def test_batched_experts_end_to_end(m, n, k, e, topk):
         baseline_output = torch_experts(a, w1, w2, topk_weight, topk_ids)
         triton_output = batched_moe(a, w1, w2, topk_weight, topk_ids)
 
+    torch.testing.assert_close(triton_output, baseline_output, atol=3e-2, rtol=2e-2)
+
+
+@pytest.mark.parametrize("m,n,k,e,topk", [(32, 512, 512, 8, 2), (45, 1024, 128, 8, 1)])
+def test_batched_experts_sssglu_matches_reference(m, n, k, e, topk):
+    """BatchedTritonExperts must compute SSSGLU, not merely accept it.
+
+    The batched path flattens its padded 3-D workspace to 2-D and delegates to
+    apply_moe_activation, so SSSGLU needs no batched-specific kernel. This
+    guards that delegation against a torch reference. The topk=1 case leaves
+    experts unevenly loaded, so padded workspace rows are exercised too: they
+    must stay masked out of the result.
+    """
+    if not (current_platform.is_xpu() or current_platform.is_cuda_alike()):
+        pytest.skip("No GPU device available")
+
+    assert BatchedTritonExperts._supports_activation(MoEActivation.SSSGLU)
+
+    from vllm.v1.worker.workspace import init_workspace_manager
+
+    set_random_seed(7)
+    device = current_platform.device_type
+    init_workspace_manager(torch.device(f"{device}:0"))
+
+    a = torch.randn((m, k), device=device, dtype=torch.bfloat16) / 10
+    score = torch.randn((m, e), device=device, dtype=torch.bfloat16)
+    w1 = torch.randn((e, 2 * n, k), device=device, dtype=torch.bfloat16) / 15
+    w2 = torch.randn((e, k, n), device=device, dtype=torch.bfloat16) / 15
+
+    with set_current_vllm_config(vllm_config):
+        topk_weight, topk_ids, _ = fused_topk(a, score, topk, False)
+
+        baseline_output = torch_experts(
+            a, w1, w2, topk_weight, topk_ids, activation=MoEActivation.SSSGLU
+        )
+        triton_output = batched_moe(
+            a, w1, w2, topk_weight, topk_ids, activation=MoEActivation.SSSGLU
+        )
+
+    assert torch.isfinite(triton_output).all()
     torch.testing.assert_close(triton_output, baseline_output, atol=3e-2, rtol=2e-2)
 
 
