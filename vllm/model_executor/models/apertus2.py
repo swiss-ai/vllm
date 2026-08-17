@@ -10,7 +10,9 @@ from transformers.configuration_utils import PretrainedConfig
 
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
+from vllm.config.parallel import ParallelConfig
 from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.model_executor.layers.activation import SSSGLUAndMul
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEFactory, GateLinear
@@ -42,6 +44,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    sequence_parallel_chunk,
 )
 
 
@@ -117,6 +120,7 @@ class Apertus2MLP(nn.Module):
         quant_config: QuantizationConfig | None = None,
         bias: bool = False,
         prefix: str = "",
+        is_sequence_parallel: bool = False,
         reduce_results: bool = True,
     ) -> None:
         super().__init__()
@@ -125,6 +129,7 @@ class Apertus2MLP(nn.Module):
             output_sizes=[intermediate_size, intermediate_size],
             bias=bias,
             quant_config=quant_config,
+            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
@@ -133,6 +138,7 @@ class Apertus2MLP(nn.Module):
             bias=bias,
             quant_config=quant_config,
             reduce_results=reduce_results,
+            disable_tp=is_sequence_parallel,
             prefix=f"{prefix}.down_proj",
         )
         if hidden_act != "sssglu":
@@ -155,6 +161,7 @@ class Apertus2MoE(nn.Module):
         self,
         config: PretrainedConfig,
         quant_config: QuantizationConfig | None = None,
+        parallel_config: ParallelConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -166,6 +173,8 @@ class Apertus2MoE(nn.Module):
         self.n_shared_experts = config.n_shared_experts
         latent_size = getattr(config, "moe_latent_size", None)
         self.moe_hidden_size = latent_size or self.hidden_size
+
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         self.gate = GateLinear(
             input_size=self.hidden_size,
@@ -194,6 +203,7 @@ class Apertus2MoE(nn.Module):
                 quant_config=quant_config,
                 bias=False,
                 reduce_results=False,
+                is_sequence_parallel=self.is_sequence_parallel,
                 prefix=f"{prefix}.shared_experts",
             )
         else:
@@ -231,6 +241,7 @@ class Apertus2MoE(nn.Module):
             routed_input_transform=self.latent_down_proj,
             routed_output_transform=self.latent_up_proj,
             routed_scaling_factor=config.routed_scaling_factor,
+            is_sequence_parallel=self.is_sequence_parallel,
             apply_routed_scale_to_output=True,
             router_logits_dtype=torch.float32,
             prefix=f"{prefix}.experts",
@@ -252,14 +263,22 @@ class Apertus2MoE(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        original_shape = hidden_states.shape
-        hidden_states = hidden_states.reshape(-1, self.hidden_size)
+        num_tokens, hidden_dim = hidden_states.shape
+        hidden_states = hidden_states.view(-1, hidden_dim)
+
+        if self.is_sequence_parallel:
+            hidden_states = sequence_parallel_chunk(hidden_states)
+
         router_logits, _ = self.gate(hidden_states)
         output = self.experts(
             hidden_states=hidden_states,
             router_logits=router_logits,
         )
-        return output.reshape(original_shape)
+        if self.is_sequence_parallel:
+            output = tensor_model_parallel_all_gather(output, 0)
+            output = output[:num_tokens]
+
+        return output.view(num_tokens, hidden_dim)
 
 
 class Apertus2Attention(nn.Module):
@@ -395,6 +414,7 @@ class Apertus2DecoderLayer(nn.Module):
         config: PretrainedConfig,
         cache_config: CacheConfig | None = None,
         quant_config: QuantizationConfig | None = None,
+        parallel_config: ParallelConfig | None = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -422,6 +442,7 @@ class Apertus2DecoderLayer(nn.Module):
             self.mlp = Apertus2MoE(
                 config=config,
                 quant_config=quant_config,
+                parallel_config=parallel_config,
                 prefix=f"{prefix}.mlp",
             )
         else:
@@ -491,6 +512,7 @@ class Apertus2Model(nn.Module):
         config = vllm_config.model_config.hf_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
+        parallel_config = vllm_config.parallel_config
         if quant_config is not None:
             raise ValueError(
                 "Apertus2 currently supports only unquantized BF16 inference."
@@ -498,10 +520,6 @@ class Apertus2Model(nn.Module):
         if vllm_config.model_config.dtype != torch.bfloat16:
             raise ValueError(
                 "Apertus2 currently supports only unquantized BF16 inference."
-            )
-        if vllm_config.parallel_config.use_sequence_parallel_moe:
-            raise ValueError(
-                "Apertus2 sequence-parallel MoE support is deferred to Phase 3."
             )
 
         self.config = config
@@ -526,6 +544,7 @@ class Apertus2Model(nn.Module):
                 config=config,
                 cache_config=cache_config,
                 quant_config=quant_config,
+                parallel_config=parallel_config,
                 prefix=prefix,
             ),
             prefix=f"{prefix}.layers",

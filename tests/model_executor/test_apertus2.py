@@ -137,7 +137,11 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
         routed_scaling_factor=2.5,
         use_quantile_balancing=True,
     )
-    moe = apertus2.Apertus2MoE(config, prefix="model.layers.1.mlp")
+    moe = apertus2.Apertus2MoE(
+        config,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+        prefix="model.layers.1.mlp",
+    )
     gate_args = captured["gate"]
     expert_args = captured["experts"]
 
@@ -145,6 +149,8 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
     assert gate_args["force_fp32_compute"] is True
     assert [args["output_size"] for args in captured["projections"]] == [2, 4]
     assert captured["shared"]["reduce_results"] is False
+    assert captured["shared"]["is_sequence_parallel"] is False
+    assert expert_args["is_sequence_parallel"] is False
     assert expert_args["hidden_size"] == 2
     assert expert_args["activation"] == "sssglu"
     assert expert_args["shared_experts"] is moe.shared_experts
@@ -176,7 +182,7 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
         "renormalize": True,
     }
 
-    hidden_states = torch.randn(2, 3, 4)
+    hidden_states = torch.randn(6, 4)
     assert moe(hidden_states).shape == hidden_states.shape
     expert_hidden, expert_logits = captured["expert_inputs"]
     assert expert_hidden.shape == (6, 4)
@@ -186,6 +192,161 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
 def test_apertus2_moe_rejects_non_qb_routing() -> None:
     with pytest.raises(ValueError, match="only QB routing"):
         apertus2.Apertus2MoE(SimpleNamespace(use_quantile_balancing=False))
+
+
+def _make_stubbed_moe(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    sequence_parallel: bool,
+    captured: dict[str, Any],
+) -> apertus2.Apertus2MoE:
+    """Build an Apertus2MoE whose gate/shared/experts are shape-preserving fakes."""
+
+    class FakeGate(nn.Module):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            self.output_size = kwargs["output_size"]
+
+        def forward(self, hidden_states: torch.Tensor):
+            logits = hidden_states.new_zeros(
+                (hidden_states.shape[0], self.output_size), dtype=torch.float32
+            )
+            return logits, None
+
+    class FakeShared(nn.Identity):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            captured["shared"] = kwargs
+
+    class FakeExperts(nn.Module):
+        def forward(self, hidden_states, router_logits):
+            captured["expert_tokens"] = hidden_states.shape[0]
+            return hidden_states
+
+    def make_experts(**kwargs):
+        captured["experts"] = kwargs
+        return FakeExperts()
+
+    monkeypatch.setattr(apertus2, "GateLinear", FakeGate)
+    monkeypatch.setattr(apertus2, "Apertus2MLP", FakeShared)
+    monkeypatch.setattr(apertus2, "FusedMoEFactory", make_experts)
+
+    config = SimpleNamespace(
+        hidden_size=4,
+        hidden_act="sssglu",
+        n_routed_experts=5,
+        n_shared_experts=1,
+        num_experts_per_tok=2,
+        moe_intermediate_size=3,
+        norm_topk_prob=True,
+        routed_scaling_factor=2.5,
+        use_quantile_balancing=True,
+    )
+    return apertus2.Apertus2MoE(
+        config,
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=sequence_parallel),
+        prefix="model.layers.1.mlp",
+    )
+
+
+def test_apertus2_moe_sequence_parallel_chunks_gathers_and_trims(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SP forward must trim the gathered output to the pre-chunk token count."""
+    captured: dict[str, Any] = {}
+    moe = _make_stubbed_moe(monkeypatch, sequence_parallel=True, captured=captured)
+
+    tp_size = 2
+
+    def fake_chunk(hidden_states: torch.Tensor) -> torch.Tensor:
+        captured["chunk_tokens"] = hidden_states.shape[0]
+        pad_rows = -hidden_states.shape[0] % tp_size
+        padded = torch.cat(
+            [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[1])]
+        )
+        return padded[: padded.shape[0] // tp_size]
+
+    def fake_all_gather(tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        assert dim == 0
+        captured["gathered_tokens"] = tensor.shape[0]
+        return torch.cat([tensor, torch.full_like(tensor, 7.0)])
+
+    monkeypatch.setattr(apertus2, "sequence_parallel_chunk", fake_chunk)
+    monkeypatch.setattr(apertus2, "tensor_model_parallel_all_gather", fake_all_gather)
+
+    hidden_states = torch.randn(5, 4)
+    output = moe(hidden_states)
+
+    assert captured["chunk_tokens"] == 5
+    assert captured["expert_tokens"] == 3
+    assert captured["gathered_tokens"] == 3
+    assert output.shape == (5, 4)
+    torch.testing.assert_close(output[:3], hidden_states[:3])
+    torch.testing.assert_close(output[3:], torch.full((2, 4), 7.0))
+
+
+def test_apertus2_moe_without_sequence_parallel_skips_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    moe = _make_stubbed_moe(monkeypatch, sequence_parallel=False, captured=captured)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("collective must not run without sequence parallel")
+
+    monkeypatch.setattr(apertus2, "sequence_parallel_chunk", forbidden)
+    monkeypatch.setattr(apertus2, "tensor_model_parallel_all_gather", forbidden)
+
+    hidden_states = torch.randn(5, 4)
+    torch.testing.assert_close(moe(hidden_states), hidden_states)
+
+
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_apertus2_moe_propagates_sequence_parallel_flag(
+    monkeypatch: pytest.MonkeyPatch,
+    sequence_parallel: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+    _make_stubbed_moe(
+        monkeypatch, sequence_parallel=sequence_parallel, captured=captured
+    )
+
+    assert captured["shared"]["is_sequence_parallel"] is sequence_parallel
+    assert captured["experts"]["is_sequence_parallel"] is sequence_parallel
+
+
+@pytest.mark.parametrize(
+    ("mlp_kwargs", "expected_disable_tp"),
+    [
+        ({}, False),
+        ({"is_sequence_parallel": False}, False),
+        ({"is_sequence_parallel": True}, True),
+    ],
+)
+def test_apertus2_mlp_disable_tp_follows_sequence_parallel(
+    default_vllm_config,
+    monkeypatch: pytest.MonkeyPatch,
+    mlp_kwargs: dict[str, Any],
+    expected_disable_tp: bool,
+) -> None:
+    captured: list[dict[str, Any]] = []
+
+    class FakeLinear(nn.Identity):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            captured.append(kwargs)
+
+    monkeypatch.setattr(apertus2, "MergedColumnParallelLinear", FakeLinear)
+    monkeypatch.setattr(apertus2, "RowParallelLinear", FakeLinear)
+
+    apertus2.Apertus2MLP(
+        hidden_size=4,
+        intermediate_size=3,
+        hidden_act="sssglu",
+        **mlp_kwargs,
+    )
+
+    assert [kwargs["disable_tp"] for kwargs in captured] == [expected_disable_tp] * 2
 
 
 @pytest.mark.parametrize("sandwich", [False, True])
@@ -378,11 +539,56 @@ def test_apertus2_attention_zero_gate_halves_pre_o_proj_output(
     assert gated_output.dtype == hidden_states.dtype
 
 
+def test_apertus2_decoder_layer_routes_parallel_config_only_to_moe(
+    stub_apertus2_attention: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    class FakeMoE(nn.Identity):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            captured["moe"] = kwargs
+
+    class FakeMLP(nn.Identity):
+        def __init__(self, **kwargs) -> None:
+            super().__init__()
+            captured["mlp"] = kwargs
+
+    monkeypatch.setattr(apertus2, "Apertus2MoE", FakeMoE)
+    monkeypatch.setattr(apertus2, "Apertus2MLP", FakeMLP)
+
+    parallel_config = SimpleNamespace(use_sequence_parallel_moe=True)
+    config = SimpleNamespace(
+        hidden_size=8,
+        residual_multiplier=1.0,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=3,
+        hidden_act="sssglu",
+        rms_norm_eps=1e-5,
+        sandwich_norm=False,
+        head_dim=4,
+        rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+        is_moe_layer=lambda layer_idx: layer_idx == 1,
+    )
+
+    for layer_idx in (0, 1):
+        apertus2.Apertus2DecoderLayer(
+            config,
+            parallel_config=parallel_config,
+            prefix=f"model.layers.{layer_idx}",
+        )
+
+    assert captured["moe"]["parallel_config"] is parallel_config
+    assert "parallel_config" not in captured["mlp"]
+    assert "is_sequence_parallel" not in captured["mlp"]
+
+
 def _model_vllm_config(
     *,
     quant_config=None,
     dtype: torch.dtype = torch.bfloat16,
-    sequence_parallel: bool = False,
 ):
     hf_config = SimpleNamespace(
         vocab_size=16,
@@ -396,7 +602,7 @@ def _model_vllm_config(
         model_config=SimpleNamespace(hf_config=hf_config, dtype=dtype),
         cache_config=None,
         quant_config=quant_config,
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=sequence_parallel),
+        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
 
@@ -406,7 +612,6 @@ def _model_vllm_config(
     [
         (_model_vllm_config(quant_config=object()), "unquantized BF16"),
         (_model_vllm_config(dtype=torch.float16), "unquantized BF16"),
-        (_model_vllm_config(sequence_parallel=True), "deferred to Phase 3"),
     ],
 )
 def test_apertus2_model_rejects_unsupported_modes(config, message: str) -> None:
