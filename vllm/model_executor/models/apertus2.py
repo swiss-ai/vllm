@@ -48,19 +48,48 @@ from .utils import (
 )
 
 
+# Canonical QB selection score spaces plus the Megatron estimator spellings
+# that map onto them; mirrors hfconverter's normalization.
+_QB_METHOD_ALIASES = {
+    "average": "sigmoid",
+    "histogram": "sigmoid",
+    "legacy_average": "legacy",
+}
+
+
+def resolve_quantile_balancing_method(config: PretrainedConfig) -> str:
+    """Return the canonical QB selection method ("sigmoid" or "legacy")."""
+    raw = getattr(config, "moe_router_quantile_balancing_method", "sigmoid")
+    method = _QB_METHOD_ALIASES.get(raw, raw)
+    if method not in ("sigmoid", "legacy"):
+        raise ValueError(
+            "moe_router_quantile_balancing_method must be 'sigmoid' or "
+            "'legacy' (Megatron spellings 'average', 'histogram', and "
+            f"'legacy_average' are also accepted); got {raw!r}."
+        )
+    return method
+
+
 def quantile_balancing_routing_native(
     logits: torch.Tensor,
     qb_beta: torch.Tensor,
     top_k: int,
     renormalize: bool,
+    sigmoid_selection: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Select experts with QB offsets and return unscaled unbiased weights.
 
-    Exact ties in ``logits - qb_beta`` follow ``torch.topk`` semantics; expert
-    membership and ordering at the tie boundary are otherwise unspecified.
+    With ``sigmoid_selection`` experts are chosen from
+    ``sigmoid(logits) - qb_beta``; otherwise from raw ``logits - qb_beta``
+    (the legacy score space of early QB runs). Mixture weights always come
+    from the unbiased sigmoid scores. Exact ties in the selection scores
+    follow ``torch.topk`` semantics; expert membership and ordering at the
+    tie boundary are otherwise unspecified.
     """
     logits = logits.float()
-    selection_scores = logits - qb_beta.float()
+    gate_scores = torch.sigmoid(logits)
+    qb_scores = gate_scores if sigmoid_selection else logits
+    selection_scores = qb_scores - qb_beta.float()
     topk_ids = torch.topk(
         selection_scores,
         k=top_k,
@@ -68,7 +97,7 @@ def quantile_balancing_routing_native(
         sorted=False,
     ).indices
 
-    topk_weights = torch.sigmoid(logits).gather(1, topk_ids)
+    topk_weights = gate_scores.gather(1, topk_ids)
     if renormalize:
         normalizer = topk_weights.sum(dim=-1, keepdim=True) + 1e-20
         topk_weights = topk_weights / normalizer
@@ -87,6 +116,7 @@ def quantile_balancing_routing(
     qb_beta: torch.Tensor,
     top_k: int,
     renormalize: bool,
+    sigmoid_selection: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run quantile-balancing routing as one compiled tensor region."""
     return quantile_balancing_routing_native(
@@ -94,6 +124,7 @@ def quantile_balancing_routing(
         qb_beta,
         top_k,
         renormalize,
+        sigmoid_selection,
     )
 
 
@@ -167,6 +198,9 @@ class Apertus2MoE(nn.Module):
         super().__init__()
         if not getattr(config, "use_quantile_balancing", False):
             raise ValueError("Apertus2MoE currently supports only QB routing.")
+        self.qb_sigmoid_selection = (
+            resolve_quantile_balancing_method(config) == "sigmoid"
+        )
 
         self.hidden_size = config.hidden_size
         self.n_routed_experts = config.n_routed_experts
@@ -260,6 +294,7 @@ class Apertus2MoE(nn.Module):
             qb_beta=self.gate.qb_beta,
             top_k=topk,
             renormalize=renormalize,
+            sigmoid_selection=self.qb_sigmoid_selection,
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -23,17 +23,22 @@ def _qb_reference(
     qb_beta: torch.Tensor,
     top_k: int,
     renormalize: bool,
+    sigmoid_selection: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     logits = logits.float()
-    ids = torch.topk(logits - qb_beta.float(), top_k, dim=-1, sorted=False).indices
+    qb_scores = torch.sigmoid(logits) if sigmoid_selection else logits
+    ids = torch.topk(qb_scores - qb_beta.float(), top_k, dim=-1, sorted=False).indices
     weights = torch.sigmoid(logits).gather(1, ids)
     if renormalize:
         weights /= weights.sum(dim=-1, keepdim=True) + 1e-20
     return weights.float(), ids.int()
 
 
+@pytest.mark.parametrize("sigmoid_selection", [True, False])
 @pytest.mark.parametrize("renormalize", [False, True])
-def test_quantile_balancing_routing_matches_reference(renormalize: bool) -> None:
+def test_quantile_balancing_routing_matches_reference(
+    renormalize: bool, sigmoid_selection: bool
+) -> None:
     logits = torch.tensor(
         [
             [3.0, -1.0, 0.5, 2.0, -4.0],
@@ -46,9 +51,19 @@ def test_quantile_balancing_routing_matches_reference(renormalize: bool) -> None
     beta_before = qb_beta.clone()
 
     actual = quantile_balancing_routing_native(
-        logits, qb_beta, top_k=3, renormalize=renormalize
+        logits,
+        qb_beta,
+        top_k=3,
+        renormalize=renormalize,
+        sigmoid_selection=sigmoid_selection,
     )
-    expected = _qb_reference(logits, qb_beta, top_k=3, renormalize=renormalize)
+    expected = _qb_reference(
+        logits,
+        qb_beta,
+        top_k=3,
+        renormalize=renormalize,
+        sigmoid_selection=sigmoid_selection,
+    )
 
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
@@ -58,30 +73,75 @@ def test_quantile_balancing_routing_matches_reference(renormalize: bool) -> None
     torch.testing.assert_close(qb_beta, beta_before)
 
 
-def test_quantile_balancing_uses_unbiased_logits_for_weights() -> None:
+@pytest.mark.parametrize(
+    ("sigmoid_selection", "expected_id"),
+    [(False, 0), (True, 1)],
+)
+def test_quantile_balancing_uses_unbiased_logits_for_weights(
+    sigmoid_selection: bool, expected_id: int
+) -> None:
+    """The score space decides the winner; the weight stays bias-free sigmoid.
+
+    Legacy raw-logit selection keeps expert 0 (10 - 8 = 2 still wins), while
+    sigmoid selection saturates near 1 so the same beta pushes expert 0 below
+    expert 1.
+    """
     logits = torch.tensor([[10.0, 1.0, -5.0]])
     qb_beta = torch.tensor([8.0, 0.5, 0.0])
 
     weights, ids = quantile_balancing_routing_native(
-        logits, qb_beta, top_k=1, renormalize=False
+        logits, qb_beta, top_k=1, renormalize=False, sigmoid_selection=sigmoid_selection
     )
 
-    assert ids.item() == 0
-    torch.testing.assert_close(weights, torch.sigmoid(logits[:, :1]))
+    assert ids.item() == expected_id
+    torch.testing.assert_close(
+        weights, torch.sigmoid(logits[:, expected_id : expected_id + 1])
+    )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+@pytest.mark.parametrize("sigmoid_selection", [True, False])
 @torch.inference_mode()
-def test_quantile_balancing_compiled_matches_reference() -> None:
+def test_quantile_balancing_compiled_matches_reference(sigmoid_selection: bool) -> None:
     torch._dynamo.reset()
     logits = torch.randn(7, 13, device="cuda")
     qb_beta = torch.randn(13, device="cuda")
 
-    actual = quantile_balancing_routing(logits, qb_beta, top_k=4, renormalize=True)
-    expected = _qb_reference(logits, qb_beta, top_k=4, renormalize=True)
+    actual = quantile_balancing_routing(
+        logits, qb_beta, top_k=4, renormalize=True, sigmoid_selection=sigmoid_selection
+    )
+    expected = _qb_reference(
+        logits, qb_beta, top_k=4, renormalize=True, sigmoid_selection=sigmoid_selection
+    )
 
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(actual[1], expected[1])
+
+
+@pytest.mark.parametrize(
+    ("stored", "expected"),
+    [
+        (None, "sigmoid"),
+        ("sigmoid", "sigmoid"),
+        ("average", "sigmoid"),
+        ("histogram", "sigmoid"),
+        ("legacy", "legacy"),
+        ("legacy_average", "legacy"),
+    ],
+)
+def test_quantile_balancing_method_resolution(stored, expected: str) -> None:
+    config = SimpleNamespace()
+    if stored is not None:
+        config.moe_router_quantile_balancing_method = stored
+
+    assert apertus2.resolve_quantile_balancing_method(config) == expected
+
+
+def test_quantile_balancing_method_rejects_unknown_values() -> None:
+    config = SimpleNamespace(moe_router_quantile_balancing_method="softmax")
+
+    with pytest.raises(ValueError, match="'sigmoid' or 'legacy'"):
+        apertus2.resolve_quantile_balancing_method(config)
 
 
 def test_apertus2_moe_wires_qb_latent_and_shared_paths(
@@ -180,6 +240,7 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
         "qb_beta": moe.gate.qb_beta,
         "top_k": 2,
         "renormalize": True,
+        "sigmoid_selection": True,
     }
 
     hidden_states = torch.randn(6, 4)
@@ -194,11 +255,51 @@ def test_apertus2_moe_rejects_non_qb_routing() -> None:
         apertus2.Apertus2MoE(SimpleNamespace(use_quantile_balancing=False))
 
 
+@pytest.mark.parametrize(
+    ("qb_method", "expected"),
+    [
+        (None, True),
+        ("histogram", True),
+        ("legacy", False),
+        ("legacy_average", False),
+    ],
+)
+def test_apertus2_moe_forwards_selection_space_to_routing(
+    monkeypatch: pytest.MonkeyPatch,
+    qb_method: str | None,
+    expected: bool,
+) -> None:
+    captured: dict[str, Any] = {}
+    moe = _make_stubbed_moe(
+        monkeypatch,
+        sequence_parallel=False,
+        captured=captured,
+        qb_method=qb_method,
+    )
+    assert moe.qb_sigmoid_selection is expected
+
+    routing_call: dict[str, Any] = {}
+
+    def fake_routing(**kwargs):
+        routing_call.update(kwargs)
+        return torch.ones(1, 2), torch.zeros(1, 2, dtype=torch.int32)
+
+    monkeypatch.setattr(apertus2, "quantile_balancing_routing", fake_routing)
+    captured["experts"]["custom_routing_function"](
+        hidden_states=torch.randn(1, 4),
+        gating_output=torch.randn(1, 5),
+        topk=2,
+        renormalize=True,
+    )
+    assert routing_call["sigmoid_selection"] is expected
+
+
 def _make_stubbed_moe(
     monkeypatch: pytest.MonkeyPatch,
     *,
     sequence_parallel: bool,
     captured: dict[str, Any],
+    qb_method: str | None = None,
 ) -> apertus2.Apertus2MoE:
     """Build an Apertus2MoE whose gate/shared/experts are shape-preserving fakes."""
 
@@ -242,6 +343,8 @@ def _make_stubbed_moe(
         routed_scaling_factor=2.5,
         use_quantile_balancing=True,
     )
+    if qb_method is not None:
+        config.moe_router_quantile_balancing_method = qb_method
     return apertus2.Apertus2MoE(
         config,
         parallel_config=SimpleNamespace(use_sequence_parallel_moe=sequence_parallel),
