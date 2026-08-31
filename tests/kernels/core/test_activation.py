@@ -138,6 +138,7 @@ def test_sssglu_and_mul(
     device: str,
 ) -> None:
     default_vllm_config.compilation_config.custom_ops = ["all"]
+    torch.cuda.set_device(device)
     x = torch.randn(shape, dtype=dtype, device=device)
 
     output = SSSGLUAndMul()(x)
@@ -150,6 +151,7 @@ def test_sssglu_and_mul(
 @pytest.mark.parametrize("device", CUDA_DEVICES)
 @torch.inference_mode()
 def test_sssglu_and_mul_preserves_bf16_cast_boundary(device: str) -> None:
+    torch.cuda.set_device(device)
     gate = torch.tensor(
         [-1.0, -0.0009765625, 0.5, 0.99609375, 1.5, 1.9921875, 3.0],
         dtype=torch.bfloat16,
