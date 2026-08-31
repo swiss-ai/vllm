@@ -675,6 +675,8 @@ class Apertus2ForCausalLM(nn.Module, SupportsPP):
                 quant_config=quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
+            if config.tie_word_embeddings:
+                self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
             self.logits_processor = LogitsProcessor(config.vocab_size)
         else:
             self.lm_head = PPMissingLayer()
@@ -722,5 +724,8 @@ class Apertus2ForCausalLM(nn.Module, SupportsPP):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        loader = AutoWeightsLoader(self)
+        loader = AutoWeightsLoader(
+            self,
+            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
+        )
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)

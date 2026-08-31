@@ -692,13 +692,14 @@ def _model_vllm_config(
     *,
     quant_config=None,
     dtype: torch.dtype = torch.bfloat16,
+    tie_word_embeddings: bool = False,
 ):
     hf_config = SimpleNamespace(
         vocab_size=16,
         hidden_size=4,
         num_hidden_layers=2,
         rms_norm_eps=1e-5,
-        tie_word_embeddings=False,
+        tie_word_embeddings=tie_word_embeddings,
         embedding_multiplier=1.0,
     )
     return SimpleNamespace(
@@ -720,6 +721,69 @@ def _model_vllm_config(
 def test_apertus2_model_rejects_unsupported_modes(config, message: str) -> None:
     with pytest.raises(ValueError, match=message):
         apertus2.Apertus2Model(vllm_config=config)
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_apertus2_lm_head_ties_and_loader_skips_when_tied(
+    monkeypatch, tied: bool
+) -> None:
+    config = _model_vllm_config(tie_word_embeddings=tied)
+
+    embed_tokens = nn.Module()
+    tied_head = nn.Module()
+
+    class FakeModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_tokens = embed_tokens
+            self.make_empty_intermediate_tensors = lambda *a, **k: None
+
+    class FakeLMHead(nn.Module):
+        last: "FakeLMHead | None" = None
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__()
+            self.tied_to: Any = None
+            FakeLMHead.last = self
+
+        def tie_weights(self, embed: Any) -> Any:
+            self.tied_to = embed
+            return tied_head
+
+    captured: dict[str, Any] = {}
+
+    class FakeLoader:
+        def __init__(self, module: Any, *, skip_prefixes: Any = None) -> None:
+            captured["skip_prefixes"] = skip_prefixes
+
+        def load_weights(self, weights: Any, mapper: Any = None) -> set[str]:
+            return set()
+
+    monkeypatch.setattr(
+        apertus2.Apertus2ForCausalLM,
+        "_init_model",
+        lambda self, **kwargs: FakeModel(),
+    )
+    monkeypatch.setattr(apertus2, "ParallelLMHead", FakeLMHead)
+    monkeypatch.setattr(apertus2, "LogitsProcessor", lambda vocab_size: nn.Module())
+    monkeypatch.setattr(
+        apertus2, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
+    )
+    monkeypatch.setattr(apertus2, "AutoWeightsLoader", FakeLoader)
+
+    model = apertus2.Apertus2ForCausalLM(vllm_config=config)
+
+    if tied:
+        assert model.lm_head is tied_head
+        assert FakeLMHead.last is not None
+        assert FakeLMHead.last.tied_to is embed_tokens
+    else:
+        assert isinstance(model.lm_head, FakeLMHead)
+        assert FakeLMHead.last is not None
+        assert FakeLMHead.last.tied_to is None
+
+    assert model.load_weights(iter([])) == set()
+    assert captured["skip_prefixes"] == (["lm_head."] if tied else None)
 
 
 @pytest.mark.parametrize(
