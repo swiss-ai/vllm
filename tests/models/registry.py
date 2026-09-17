@@ -208,6 +208,12 @@ _TEXT_GENERATION_EXAMPLE_MODELS = {
         trust_remote_code=True,
         is_available_online=False,
     ),
+    "Apertus2KDAForCausalLM": _HfExamplesInfo(
+        "swiss-ai/Apertus2-KDA",
+        dtype="bfloat16",
+        trust_remote_code=True,
+        is_available_online=False,
+    ),
     "ArceeForCausalLM": _HfExamplesInfo("arcee-ai/AFM-4.5B-Base"),
     "ArcticForCausalLM": _HfExamplesInfo("Snowflake/snowflake-arctic-instruct"),
     "AXK1ForCausalLM": _HfExamplesInfo("skt/A.X-K1", trust_remote_code=True),

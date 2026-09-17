@@ -825,3 +825,327 @@ def test_apertus2_weight_mapper(
     assert mapped_name == prefix + expected_name
     assert mapped_weight is checkpoint_weight
     assert getattr(mapped_weight, "shard_id", None) == expected_shard_id
+
+
+# ---------------------------------------------------------------------------
+# KDA (Kimi Delta Attention) layers
+# ---------------------------------------------------------------------------
+
+
+def _kda_hf_config(**overrides: Any) -> SimpleNamespace:
+    """The flat hfconverter contract for a 2-layer model: layer 0 KDA, 1 softmax."""
+    fields: dict[str, Any] = dict(
+        hidden_size=32,
+        rms_norm_eps=1e-6,
+        layer_types=["linear_attention", "full_attention"],
+        linear_num_key_heads=2,
+        linear_num_value_heads=2,
+        linear_key_head_dim=8,
+        linear_value_head_dim=8,
+        linear_conv_kernel_dim=4,
+        gate_lower_bound=-5.0,
+        linear_attn_output_gate_bias=True,
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _kda_vllm_config(
+    hf_config: SimpleNamespace,
+    tp_size: int = 1,
+    num_spec: int | None = None,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=hf_config, dtype=torch.bfloat16),
+        cache_config=SimpleNamespace(
+            mamba_cache_dtype="auto", mamba_ssm_cache_dtype="auto"
+        ),
+        quant_config=None,
+        speculative_config=(
+            SimpleNamespace(num_speculative_tokens=num_spec)
+            if num_spec is not None
+            else None
+        ),
+        parallel_config=SimpleNamespace(
+            tensor_parallel_size=tp_size, use_sequence_parallel_moe=False
+        ),
+        additional_config={},
+        compilation_config=SimpleNamespace(
+            static_forward_context={}, mode=CompilationMode.NONE
+        ),
+    )
+
+
+def test_kda_geometry_reads_flat_fields_and_rejects_bad_configs() -> None:
+    assert apertus2.kda_layer_indices(_kda_hf_config()) == [0]
+    assert apertus2.kda_layer_indices(SimpleNamespace()) == []
+    assert apertus2.kda_geometry(_kda_hf_config()) == (2, 8, 4)
+
+    with pytest.raises(ValueError, match="Apertus2ForCausalLM"):
+        apertus2.kda_geometry(
+            _kda_hf_config(layer_types=["full_attention", "full_attention"])
+        )
+    with pytest.raises(ValueError, match="linear_conv_kernel_dim"):
+        apertus2.kda_geometry(_kda_hf_config(linear_conv_kernel_dim=None))
+    with pytest.raises(ValueError, match="linear_num_key_heads"):
+        apertus2.kda_geometry(_kda_hf_config(linear_num_key_heads=4))
+    with pytest.raises(ValueError, match="linear_key_head_dim"):
+        apertus2.kda_geometry(_kda_hf_config(linear_key_head_dim=16))
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+@pytest.mark.parametrize("num_spec", [None, 3])
+def test_kda_state_classmethods_match_calculators(
+    tp_size: int, num_spec: int | None
+) -> None:
+    from vllm.model_executor.layers.mamba.mamba_utils import (
+        MambaStateCopyFuncCalculator,
+        MambaStateShapeCalculator,
+    )
+
+    cls = apertus2.Apertus2KDAForCausalLM
+    vllm_config = _kda_vllm_config(_kda_hf_config(), tp_size=tp_size, num_spec=num_spec)
+
+    assert cls.get_mamba_state_shape_from_config(
+        vllm_config
+    ) == MambaStateShapeCalculator.kda_state_shape(
+        tp_size, 2, 8, conv_kernel_size=4, num_spec=num_spec or 0
+    )
+    assert cls.get_mamba_state_dtype_from_config(vllm_config) == (
+        torch.bfloat16,
+        torch.float32,
+    )
+    assert (
+        cls.get_mamba_state_copy_func()
+        == MambaStateCopyFuncCalculator.kda_state_copy_func()
+    )
+
+    softmax_only = _kda_vllm_config(
+        _kda_hf_config(layer_types=["full_attention", "full_attention"])
+    )
+    with pytest.raises(ValueError, match="linear_attention"):
+        cls.get_mamba_state_shape_from_config(softmax_only)
+
+
+def test_remap_kda_checkpoint_keys_routes_only_kda_layers() -> None:
+    kda_leaves = {
+        "q_proj.weight": ("in_proj_qkvgfab.weight", 0),
+        "k_proj.weight": ("in_proj_qkvgfab.weight", 1),
+        "v_proj.weight": ("in_proj_qkvgfab.weight", 2),
+        "b_proj.weight": ("in_proj_qkvgfab.weight", 3),
+        "f_a_proj.weight": ("in_proj_qkvgfab.weight", 4),
+        "q_conv1d.weight": ("conv1d.weight", 0),
+        "k_conv1d.weight": ("conv1d.weight", 1),
+        "v_conv1d.weight": ("conv1d.weight", 2),
+        # Pass-through leaves already carry the vLLM module names.
+        "f_b_proj.weight": ("f_b_proj.weight", None),
+        "g_a_proj.weight": ("g_a_proj.weight", None),
+        "g_b_proj.weight": ("g_b_proj.weight", None),
+        "g_b_proj.bias": ("g_b_proj.bias", None),
+        "A_log": ("A_log", None),
+        "dt_bias": ("dt_bias", None),
+        "o_norm.weight": ("o_norm.weight", None),
+        "o_proj.weight": ("o_proj.weight", None),
+    }
+    softmax_leaves = {
+        "q_proj.weight": ("qkv_proj.weight", "q"),
+        "k_proj.weight": ("qkv_proj.weight", "k"),
+        "v_proj.weight": ("qkv_proj.weight", "v"),
+        "g_proj.weight": ("g_proj.weight", None),
+        "o_proj.weight": ("o_proj.weight", None),
+    }
+    expected: dict[str, tuple[str, Any]] = {}
+    for leaf, (target, shard) in kda_leaves.items():
+        expected[f"model.layers.0.self_attn.{leaf}"] = (
+            f"model.layers.0.self_attn.{target}",
+            shard,
+        )
+    for leaf, (target, shard) in softmax_leaves.items():
+        expected[f"model.layers.1.self_attn.{leaf}"] = (
+            f"model.layers.1.self_attn.{target}",
+            shard,
+        )
+    expected["model.layers.0.mlp.gate_proj.weight"] = (
+        "model.layers.0.mlp.gate_up_proj.weight",
+        0,
+    )
+    expected["model.embed_tokens.weight"] = ("model.embed_tokens.weight", None)
+
+    tensors = {name: torch.empty(1) for name in expected}
+    remapped = apertus2.remap_kda_checkpoint_keys(
+        iter(tensors.items()), kda_layers={0}
+    )
+    mapped = list(apertus2.Apertus2KDAForCausalLM.hf_to_vllm_mapper.apply(remapped))
+
+    assert len(mapped) == len(expected)
+    for (source, tensor), (final_name, weight) in zip(tensors.items(), mapped):
+        assert weight is tensor, source
+        assert (final_name, getattr(weight, "shard_id", None)) == expected[source], (
+            source
+        )
+
+
+def test_apertus2_decoder_layer_dispatches_kda_by_layer_types(
+    stub_apertus2_attention: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: list[dict[str, Any]] = []
+
+    class FakeKDA(nn.Module):
+        def __init__(self, config: Any, vllm_config: Any, prefix: str) -> None:
+            super().__init__()
+            built.append({"config": config, "vllm_config": vllm_config, "prefix": prefix})
+
+        def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
+            return 3.0 * hidden_states
+
+    class FakeMLP(nn.Identity):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(apertus2, "Apertus2KDAAttention", FakeKDA)
+    monkeypatch.setattr(apertus2, "Apertus2MLP", FakeMLP)
+
+    config = SimpleNamespace(
+        hidden_size=8,
+        residual_multiplier=0.5,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        intermediate_size=3,
+        hidden_act="sssglu",
+        rms_norm_eps=1e-5,
+        sandwich_norm=True,
+        head_dim=4,
+        rope_parameters={"rope_type": "default", "rope_theta": 10_000.0},
+        is_moe_layer=lambda layer_idx: False,
+        layer_types=["linear_attention", "full_attention"],
+    )
+    vllm_config = object()
+
+    kda_layer = apertus2.Apertus2DecoderLayer(
+        config, prefix="model.layers.0", vllm_config=vllm_config
+    )
+    softmax_layer = apertus2.Apertus2DecoderLayer(
+        config, prefix="model.layers.1", vllm_config=vllm_config
+    )
+
+    assert isinstance(kda_layer.self_attn, FakeKDA)
+    assert isinstance(softmax_layer.self_attn, Apertus2Attention)
+    assert built == [
+        {"config": config, "vllm_config": vllm_config, "prefix": "model.layers.0.self_attn"}
+    ]
+
+    # Norms are identity stubs: x -> x + 0.5 * 3x -> (2.5x) + 0.5 * (2.5x).
+    hidden_states = torch.ones(2, 8)
+    out = kda_layer(torch.arange(2), hidden_states)
+    torch.testing.assert_close(out, 3.75 * hidden_states)
+
+    with pytest.raises(ValueError, match="vllm_config"):
+        apertus2.Apertus2DecoderLayer(config, prefix="model.layers.0")
+
+
+def test_apertus2_for_causal_lm_refuses_kda_layer_types(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _model_vllm_config()
+    config.model_config.hf_config.layer_types = ["linear_attention", "full_attention"]
+
+    def fail_init_model(self, **kwargs: Any) -> None:
+        raise AssertionError("the guard must fire before any layer is built")
+
+    monkeypatch.setattr(apertus2.Apertus2ForCausalLM, "_init_model", fail_init_model)
+
+    with pytest.raises(ValueError, match="Apertus2KDAForCausalLM"):
+        apertus2.Apertus2ForCausalLM(vllm_config=config)
+
+
+def test_apertus2_kda_architecture_registration() -> None:
+    from vllm.config import CompilationConfig
+    from vllm.model_executor.models.registry import ModelRegistry
+
+    assert "Apertus2KDAForCausalLM" in ModelRegistry.get_supported_archs()
+    assert apertus2.Apertus2KDAForCausalLM.is_hybrid is True
+    assert apertus2.Apertus2KDAForCausalLM.has_inner_state is True
+    assert not hasattr(apertus2.Apertus2ForCausalLM, "is_hybrid")
+    assert issubclass(apertus2.Apertus2KDAForCausalLM, apertus2.Apertus2ForCausalLM)
+    packed = apertus2.Apertus2KDAForCausalLM.packed_modules_mapping
+    assert packed["in_proj_qkvgfab"] == ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"]
+    assert packed["conv1d"] == ["q_conv1d", "k_conv1d", "v_conv1d"]
+    assert "in_proj_qkvgfab" not in apertus2.Apertus2ForCausalLM.packed_modules_mapping
+
+    # The KDA core must be a splitting op or piecewise cudagraphs would capture
+    # it with stale attention metadata.
+    assert "vllm::apertus2_kda_attention_core" in CompilationConfig._attention_ops
+    assert hasattr(torch.ops.vllm, "apertus2_kda_attention_core")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="dist_init needs NCCL")
+@pytest.mark.parametrize("gate_bias", [True, False])
+def test_apertus2_kda_attention_layer_matches_frozen_contract(
+    dist_init: None, gate_bias: bool
+) -> None:
+    hf_config = _kda_hf_config(linear_attn_output_gate_bias=gate_bias)
+    vllm_config = _kda_vllm_config(hf_config)
+    prefix = "model.layers.0.self_attn"
+
+    layer = apertus2.Apertus2KDAAttention(hf_config, vllm_config, prefix=prefix)
+
+    # Geometry: q/k/v [H*D], beta [H], f_a [D] (replicated), packed fp32 conv.
+    assert layer.in_proj_qkvgfab.output_sizes == [16, 16, 16, 2, 8]
+    assert tuple(layer.conv1d.weight.shape) == (48, 1, 4)
+    assert layer.conv1d.weight.dtype == torch.float32
+    assert layer.use_full_rank_gate is False
+    assert layer.gate_lower_bound == -5.0 and layer.use_safe_gate
+    assert layer.o_norm.eps == 1e-6 and layer.o_norm.activation == "sigmoid"
+    assert (layer.g_b_proj.bias is not None) is gate_bias
+    assert vllm_config.compilation_config.static_forward_context[prefix] is layer
+
+    # The layer and the model-level classmethods must size the cache alike.
+    cls = apertus2.Apertus2KDAForCausalLM
+    assert layer.get_state_shape() == cls.get_mamba_state_shape_from_config(vllm_config)
+    assert layer.get_state_dtype() == cls.get_mamba_state_dtype_from_config(vllm_config)
+
+    # conv1d: AutoWeightsLoader passes no shard id, so it rides on the tensor.
+    conv_weight = layer.conv1d.weight
+    k_conv = torch.arange(16 * 4, dtype=torch.float32).view(16, 4)
+    k_conv.shard_id = 1
+    conv_weight.weight_loader(conv_weight, k_conv)
+    assert torch.equal(conv_weight.data[16:32, 0, :], k_conv)
+    v_conv = -torch.arange(16 * 4, dtype=torch.float32).view(16, 1, 4)
+    conv_weight.weight_loader(conv_weight, v_conv, 2)  # Kimi-style positional call
+    assert torch.equal(conv_weight.data[32:48], v_conv)
+    with pytest.raises(ValueError, match="shard id"):
+        conv_weight.weight_loader(conv_weight, torch.zeros(16, 4))
+
+    # in_proj: the merged linear's own load_weights forwards the tensor's
+    # shard id positionally, which is what the f_a replication trick keys on.
+    beta_w = torch.randn(2, 32)
+    beta_w.shard_id = 3
+    f_a_w = torch.randn(8, 32)
+    f_a_w.shard_id = 4
+    loaded = list(
+        layer.in_proj_qkvgfab.load_weights([("weight", beta_w), ("weight", f_a_w)])
+    )
+    assert loaded == ["weight", "weight"]
+    assert torch.equal(layer.in_proj_qkvgfab.weight.data[48:50], beta_w)
+    assert torch.equal(layer.in_proj_qkvgfab.weight.data[50:58], f_a_w)
+
+    if gate_bias:
+        bias = layer.g_b_proj.bias
+        assert tuple(bias.shape) == (16,)
+        expected = torch.arange(16, dtype=bias.dtype)
+        bias.weight_loader(bias, expected)
+        assert torch.equal(bias.data, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="dist_init needs NCCL")
+def test_apertus2_kda_attention_without_gate_lower_bound_uses_softplus_decay(
+    dist_init: None,
+) -> None:
+    layer = apertus2.Apertus2KDAAttention(
+        _kda_hf_config(gate_lower_bound=None),
+        _kda_vllm_config(_kda_hf_config()),
+        prefix="model.layers.0.self_attn",
+    )
+    assert layer.gate_lower_bound is None
+    assert layer.use_safe_gate is False

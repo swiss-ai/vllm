@@ -74,6 +74,7 @@ _TEXT_GENERATION_MODELS = {
     "AfmoeForCausalLM": ("afmoe", "AfmoeForCausalLM"),
     "ApertusForCausalLM": ("apertus", "ApertusForCausalLM"),
     "Apertus2ForCausalLM": ("apertus2", "Apertus2ForCausalLM"),
+    "Apertus2KDAForCausalLM": ("apertus2", "Apertus2KDAForCausalLM"),
     "ArceeForCausalLM": ("arcee", "ArceeForCausalLM"),
     "ArcticForCausalLM": ("arctic", "ArcticForCausalLM"),
     "AXK1ForCausalLM": ("AXK1", "AXK1ForCausalLM"),
