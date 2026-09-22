@@ -1196,6 +1196,12 @@ def test_apertus2_kda_attention_layer_matches_frozen_contract(
     assert torch.equal(layer.in_proj_qkvgfab.weight.data[48:50], beta_w)
     assert torch.equal(layer.in_proj_qkvgfab.weight.data[50:58], f_a_w)
 
+    # AutoWeightsLoader invokes the parameter loader without a positional shard id.
+    # Preserve the id attached by remap_kda_checkpoint_keys in that path too.
+    layer.in_proj_qkvgfab.weight.data.zero_()
+    layer.in_proj_qkvgfab.weight.weight_loader(layer.in_proj_qkvgfab.weight, beta_w)
+    assert torch.equal(layer.in_proj_qkvgfab.weight.data[48:50], beta_w)
+
     if gate_bias:
         bias = layer.g_b_proj.bias
         assert tuple(bias.shape) == (16,)
