@@ -972,9 +972,7 @@ def test_remap_kda_checkpoint_keys_routes_only_kda_layers() -> None:
     expected["model.embed_tokens.weight"] = ("model.embed_tokens.weight", None)
 
     tensors = {name: torch.empty(1) for name in expected}
-    remapped = apertus2.remap_kda_checkpoint_keys(
-        iter(tensors.items()), kda_layers={0}
-    )
+    remapped = apertus2.remap_kda_checkpoint_keys(iter(tensors.items()), kda_layers={0})
     mapped = list(apertus2.Apertus2KDAForCausalLM.hf_to_vllm_mapper.apply(remapped))
 
     assert len(mapped) == len(expected)
@@ -1076,7 +1074,11 @@ def test_apertus2_kda_architecture_registration() -> None:
     assert issubclass(apertus2.Apertus2KDAForCausalLM, apertus2.Apertus2ForCausalLM)
     packed = apertus2.Apertus2KDAForCausalLM.packed_modules_mapping
     assert packed["in_proj_qkvgfab"] == [
-        "q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "b_proj",
+        "f_a_proj",
     ]
     assert packed["conv1d"] == ["q_conv1d", "k_conv1d", "v_conv1d"]
     assert "in_proj_qkvgfab" not in apertus2.Apertus2ForCausalLM.packed_modules_mapping
@@ -1156,6 +1158,12 @@ def test_apertus2_kda_attention_layer_matches_frozen_contract(
     assert loaded == ["weight", "weight"]
     assert torch.equal(layer.in_proj_qkvgfab.weight.data[48:50], beta_w)
     assert torch.equal(layer.in_proj_qkvgfab.weight.data[50:58], f_a_w)
+
+    # AutoWeightsLoader invokes the parameter loader without a positional shard id.
+    # Preserve the id attached by remap_kda_checkpoint_keys in that path too.
+    layer.in_proj_qkvgfab.weight.data.zero_()
+    layer.in_proj_qkvgfab.weight.weight_loader(layer.in_proj_qkvgfab.weight, beta_w)
+    assert torch.equal(layer.in_proj_qkvgfab.weight.data[48:50], beta_w)
 
     if gate_bias:
         bias = layer.g_b_proj.bias

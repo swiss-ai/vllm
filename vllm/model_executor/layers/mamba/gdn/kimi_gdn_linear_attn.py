@@ -119,6 +119,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ) -> None:
+        if loaded_shard_id is None:
+            loaded_shard_id = getattr(loaded_weight, "shard_id", None)
         tp_rank = self.tp_rank
         param_tp_rank = getattr(param, "tp_rank", None)
         if loaded_shard_id == self.replicated_shard_id:
@@ -138,6 +140,8 @@ class _KimiGDNMergedColumnParallelLinear(MergedColumnParallelLinear):
         loaded_weight: torch.Tensor,
         loaded_shard_id: tuple[int, ...] | int | None = None,
     ) -> None:
+        if loaded_shard_id is None:
+            loaded_shard_id = getattr(loaded_weight, "shard_id", None)
         tp_rank = self.tp_rank
         param_tp_rank = getattr(param, "tp_rank", None)
         if loaded_shard_id == self.replicated_shard_id:
