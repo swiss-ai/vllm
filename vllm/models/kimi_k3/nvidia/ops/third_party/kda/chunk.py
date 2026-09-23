@@ -433,6 +433,7 @@ def kda_gate_chunk_cumsum_vector_kernel(
     HAS_BIAS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    A_PER_CHANNEL: tl.constexpr,
 ):
     i_s, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -502,7 +503,13 @@ def kda_gate_chunk_cumsum_vector_kernel(
         b_bias = tl.load(p_bias, boundary_check=(0,)).to(tl.float32)
         b_s += b_bias[None, :]
 
-    b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
+    if A_PER_CHANNEL:
+        o_s = i_s * BS + tl.arange(0, BS)
+        b_a = tl.exp(tl.load(
+            A_log + i_h * S + o_s, mask=o_s < S, other=0.0
+        ).to(tl.float32))[None, :]
+    else:
+        b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
     if USE_LOWER_BOUND:
         b_gate = lower_bound * tl.sigmoid(b_a * b_s)
     else:
@@ -547,6 +554,8 @@ def fused_kda_gate_chunk_cumsum(
     NT = cdiv(T, chunk_size) if cu_seqlens is None else len(chunk_indices)
 
     A_log = A_log.reshape(-1)
+    if A_log.numel() not in (H, H * D):
+        raise ValueError("A_log must contain H or H * D elements")
     if g_bias is not None:
         g_bias = g_bias.reshape(-1)
     y = torch.empty_like(raw_g, dtype=output_dtype or raw_g.dtype)
@@ -580,6 +589,7 @@ def fused_kda_gate_chunk_cumsum(
         H=H,
         S=D,
         BT=chunk_size,
+        A_PER_CHANNEL=A_log.numel() == H * D,
         USE_LOWER_BOUND=lower_bound is not None,
     )
     return y, beta_out
@@ -839,11 +849,18 @@ def kda_gate_fwd_kernel(
     BD: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
+    A_PER_CHANNEL: tl.constexpr,
 ):
     i_t, i_h = tl.program_id(0), tl.program_id(1)
     n_t = i_t * BT
 
-    b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
+    if A_PER_CHANNEL:
+        o_d = tl.arange(0, BD)
+        b_a = tl.exp(tl.load(
+            A + i_h * D + o_d, mask=o_d < D, other=0.0
+        ).to(tl.float32))[None, :]
+    else:
+        b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
 
     stride_row = H * D
     stride_col = 1
@@ -899,7 +916,7 @@ def fused_kda_gate(
     """
     Forward pass for KDA gate:
       input g: [..., H*D]
-      param A: [H] or [1, 1, H, 1]
+      param A: [H], [1, 1, H, 1], or flattened per-channel [H*D]
       beta: softplus beta parameter
       threshold: softplus threshold parameter
       return  : [..., H, D]
@@ -909,7 +926,10 @@ def fused_kda_gate(
     g = g.view(-1, g.shape[-1])
     T = g.shape[0]
     HD = g.shape[1]
-    H = A.numel()
+    H = HD // head_k_dim
+    if A.numel() not in (H, HD):
+        raise ValueError("A_log must contain H or H * D elements")
+    A = A.contiguous()
     assert H * head_k_dim == HD
     assert g.stride() == (HD, 1)
 
@@ -931,6 +951,7 @@ def fused_kda_gate(
         head_k_dim,
         BD=next_power_of_2(head_k_dim),
         HAS_BIAS=g_bias is not None,
+        A_PER_CHANNEL=A.numel() == HD,
         USE_LOWER_BOUND=lower_bound is not None,
     )
 

@@ -528,6 +528,8 @@ class Apertus2KDAAttention(KimiGatedDeltaNetAttention):
       means the unbounded softplus decay);
     * the low-rank output gate ``g_b_proj`` carries a trained bias
       (``linear_attn_output_gate_bias``), which the shared layer omits;
+    * ``linear_attn_a_log_per_channel`` selects head-wise or flattened
+      channel-wise decay scales, including whole-head TP sharding;
     * the gated output norm uses the model's ``rms_norm_eps``;
     * the packed conv1d parameter learns to take its shard id from the tensor
       attribute that ``load_weights`` sets, because ``AutoWeightsLoader`` calls
@@ -561,6 +563,27 @@ class Apertus2KDAAttention(KimiGatedDeltaNetAttention):
             },
         )
         super().__init__(kimi_view, vllm_config, prefix)
+
+        self.a_log_per_channel = getattr(
+            config, "linear_attn_a_log_per_channel", False
+        )
+        if not isinstance(self.a_log_per_channel, bool):
+            raise ValueError("linear_attn_a_log_per_channel must be a boolean")
+        a_log_size = num_heads * (head_dim if self.a_log_per_channel else 1)
+        self.A_log = nn.Parameter(
+            torch.empty(a_log_size // self.tp_size, dtype=torch.float32)
+        )
+
+        def load_a_log(param: torch.Tensor, weight: torch.Tensor) -> None:
+            if tuple(weight.shape) != (a_log_size,):
+                raise ValueError(
+                    f"{prefix}.A_log expects {(a_log_size,)} from the config, "
+                    f"got {tuple(weight.shape)}"
+                )
+            shard = weight.narrow(0, self.tp_rank * param.numel(), param.numel())
+            param.data.copy_(shard)
+
+        set_weight_attrs(self.A_log, {"weight_loader": load_a_log})
 
         self.output_gate_bias = bool(
             getattr(config, "linear_attn_output_gate_bias", True)

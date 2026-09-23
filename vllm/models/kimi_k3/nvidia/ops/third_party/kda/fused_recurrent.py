@@ -40,6 +40,7 @@ def _kda_gate_beta_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    A_PER_CHANNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
@@ -63,7 +64,12 @@ def _kda_gate_beta_fwd_kernel(
         ).to(tl.float32)
         b_g += b_bias[None, :]
 
-    b_a = exp(tl.load(A_log + i_h).to(tl.float32))
+    if A_PER_CHANNEL:
+        b_a = exp(tl.load(
+            A_log + i_h * D + o_d, mask=m_d, other=0.0
+        ).to(tl.float32))[None, :]
+    else:
+        b_a = exp(tl.load(A_log + i_h).to(tl.float32))
     if USE_LOWER_BOUND:
         b_gate = lower_bound * tl.sigmoid(b_a * b_g)
     else:
@@ -98,6 +104,8 @@ def _fused_kda_gate_beta(
     lower_bound: float | None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     B, T, H, D = raw_g.shape
+    if A_log.numel() not in (H, H * D) or not A_log.is_contiguous():
+        raise ValueError("A_log must be contiguous with H or H * D elements")
     assert B == 1
     assert raw_beta.shape == (B, T, H)
     assert raw_g.stride()[2:] == (D, 1)
@@ -123,6 +131,7 @@ def _fused_kda_gate_beta(
         D=D,
         BT=BT,
         BD=next_power_of_2(D),
+        A_PER_CHANNEL=A_log.numel() == H * D,
         num_warps=4,
         launch_pdl=current_platform.is_arch_support_pdl(),
     )
@@ -168,6 +177,7 @@ def fused_recurrent_kda_fwd_kernel(
     IS_SPEC_DECODING: tl.constexpr,
     USE_QK_L2NORM_IN_KERNEL: tl.constexpr,
     USE_GATE_IN_KERNEL: tl.constexpr,
+    A_PER_CHANNEL: tl.constexpr,
     APPLY_BETA_SIGMOID: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
@@ -248,7 +258,12 @@ def fused_recurrent_kda_fwd_kernel(
                     other=0.0,
                 ).to(tl.float32)
                 b_gate += b_bias
-            b_a = exp(tl.load(A_log + i_h).to(tl.float32))
+            if A_PER_CHANNEL:
+                b_a = exp(tl.load(
+                    A_log + i_h * K + o_k, mask=m_k, other=0.0
+                ).to(tl.float32))
+            else:
+                b_a = exp(tl.load(A_log + i_h).to(tl.float32))
             if USE_LOWER_BOUND:
                 b_gate = lower_bound * tl.sigmoid(b_a * b_gate)
             else:
@@ -366,6 +381,8 @@ def fused_recurrent_kda_fwd(
     assert cu_seqlens.is_contiguous()
     if use_gate_in_kernel:
         assert A_log is not None and A_log.is_contiguous()
+        if A_log.numel() not in (H, H * K):
+            raise ValueError("A_log must contain H or H * K elements")
         assert dt_bias is None or dt_bias.is_contiguous()
 
     if scale is None:
@@ -418,6 +435,7 @@ def fused_recurrent_kda_fwd(
         IS_SPEC_DECODING=num_accepted_tokens is not None,
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         USE_GATE_IN_KERNEL=use_gate_in_kernel,
+        A_PER_CHANNEL=use_gate_in_kernel and A_log.numel() == H * K,
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         num_warps=num_warps,
         num_stages=num_stages,
@@ -508,6 +526,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     BK: tl.constexpr,
     BV: tl.constexpr,
     SOFTPLUS_THRESHOLD: tl.constexpr,
+    A_PER_CHANNEL: tl.constexpr,
     USE_LOWER_BOUND: tl.constexpr,
     launch_pdl: tl.constexpr,
 ):
@@ -556,7 +575,12 @@ def fused_recurrent_kda_packed_decode_kernel(
     p_g = raw_g + i_n * stride_g_token + i_h * K + o_k
     b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
     b_bias = tl.load(dt_bias + i_h * K + o_k, mask=mask_k, other=0).to(tl.float32)
-    b_a = exp(tl.load(A_log + i_h).to(tl.float32))
+    if A_PER_CHANNEL:
+        b_a = exp(tl.load(
+            A_log + i_h * K + o_k, mask=mask_k, other=0.0
+        ).to(tl.float32))
+    else:
+        b_a = exp(tl.load(A_log + i_h).to(tl.float32))
     b_g += b_bias
     if USE_LOWER_BOUND:
         b_gate = lower_bound * tl.sigmoid(b_a * b_g)
@@ -629,7 +653,7 @@ def fused_recurrent_kda_packed_decode(
         raise ValueError(f"Unexpected raw beta shape {tuple(raw_beta.shape)}.")
     if mixed_qkv.shape[1] != 2 * H * K + H * V:
         raise ValueError(f"Unexpected packed QKV shape {tuple(mixed_qkv.shape)}.")
-    if A_log.numel() != H or dt_bias.numel() != H * K:
+    if A_log.numel() not in (H, H * K) or dt_bias.numel() != H * K:
         raise ValueError("`A_log` or `dt_bias` has an incompatible shape.")
     if state_indices.shape[0] != B:
         raise ValueError("`state_indices` must contain one entry per token.")
@@ -663,6 +687,7 @@ def fused_recurrent_kda_packed_decode(
         BK=BK,
         BV=BV,
         SOFTPLUS_THRESHOLD=20.0,
+        A_PER_CHANNEL=A_log.numel() == H * K,
         USE_LOWER_BOUND=lower_bound is not None,
         num_warps=4,
         num_stages=2,
