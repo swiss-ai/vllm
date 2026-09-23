@@ -211,10 +211,12 @@ def test_chunk_kda(
     ],
 )
 @torch.inference_mode()
+@pytest.mark.parametrize("per_channel", [False, True])
 def test_chunk_kda_fused_gate_cumsum_matches_unfused(
     cu_seqlens: list[int],
     dtype: torch.dtype,
     lower_bound: float | None,
+    per_channel: bool,
 ):
     H, D = 8, 64
     T = cu_seqlens[-1]
@@ -229,7 +231,10 @@ def test_chunk_kda_fused_gate_cumsum_matches_unfused(
     beta_storage = torch.randn(1, T, 2 * H + 3, dtype=dtype, device=DEVICE)
     raw_beta = beta_storage[..., 1 : 2 * H + 1 : 2]
     beta = raw_beta.float().sigmoid()
-    A_log = (torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.5).contiguous()
+    A_log = (
+        torch.randn(H * D if per_channel else H, dtype=torch.float32, device=DEVICE)
+        * 0.5
+    ).contiguous()
     dt_bias = (
         torch.randn(H * D, dtype=torch.float32, device=DEVICE) * 0.1
     ).contiguous()
@@ -245,10 +250,14 @@ def test_chunk_kda_fused_gate_cumsum_matches_unfused(
     )
     if lower_bound is not None:
         expected_gate = lower_bound * torch.sigmoid(
-            A_log.exp()[None, :, None]
+            A_log.exp().view(H, D if per_channel else 1)
             * (raw_g.float().view(T, H, D) + dt_bias.view(H, D))
         )
-        torch.testing.assert_close(gate, expected_gate)
+    else:
+        expected_gate = -A_log.exp().view(H, D if per_channel else 1) * F.softplus(
+            raw_g.float().view(T, H, D) + dt_bias.view(H, D)
+        )
+    torch.testing.assert_close(gate, expected_gate)
     gate = gate.unsqueeze(0)
     old_o, old_ht = chunk_kda(
         q=q.clone(),
@@ -284,12 +293,14 @@ def test_chunk_kda_fused_gate_cumsum_matches_unfused(
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
 @pytest.mark.parametrize("state_indices_stride", [1, 8])
 @pytest.mark.parametrize("impl", PACKED_DECODE_IMPLS.keys())
+@pytest.mark.parametrize("per_channel", [False, True])
 @torch.inference_mode()
 def test_packed_kda_decode_correctness(
     num_seqs: int,
     lower_bound: float | None,
     state_indices_stride: int,
     impl: str,
+    per_channel: bool,
 ):
     H, D = 8, 128
     torch.manual_seed(321)
@@ -321,7 +332,9 @@ def test_packed_kda_decode_correctness(
         device=DEVICE,
     )
     beta = raw_beta.float().sigmoid()
-    A_log = torch.randn(H, dtype=torch.float32, device=DEVICE) * 0.5
+    A_log = torch.randn(
+        H * D if per_channel else H, dtype=torch.float32, device=DEVICE
+    ) * 0.5
     dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
     state_storage = torch.randn(
         num_seqs + 1,
@@ -393,11 +406,13 @@ def test_packed_kda_decode_correctness(
     [(12, True), (12, False), (12, None), (96, None)],
 )
 @pytest.mark.parametrize("lower_bound", [-5.0, None])
+@pytest.mark.parametrize("per_channel", [False, True])
 @torch.inference_mode()
 def test_kda_spec_decode_correctness(
     H: int,
     fuse_gate: bool | None,
     lower_bound: float | None,
+    per_channel: bool,
 ):
     num_seqs, query_len, D = 3, 3, 128
     T = num_seqs * query_len
@@ -428,7 +443,9 @@ def test_kda_spec_decode_correctness(
         device=DEVICE,
     )
     raw_beta = beta_storage[..., :H]
-    A_log = 0.5 * torch.randn(H, dtype=torch.float32, device=DEVICE)
+    A_log = 0.5 * torch.randn(
+        H * D if per_channel else H, dtype=torch.float32, device=DEVICE
+    )
     dt_bias = 0.1 * torch.randn(H, D, dtype=torch.float32, device=DEVICE)
     cu_seqlens = torch.arange(
         0,

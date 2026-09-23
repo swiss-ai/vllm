@@ -994,7 +994,9 @@ def test_apertus2_decoder_layer_dispatches_kda_by_layer_types(
     class FakeKDA(nn.Module):
         def __init__(self, config: Any, vllm_config: Any, prefix: str) -> None:
             super().__init__()
-            built.append({"config": config, "vllm_config": vllm_config, "prefix": prefix})
+            built.append(
+                {"config": config, "vllm_config": vllm_config, "prefix": prefix}
+            )
 
         def forward(self, positions: torch.Tensor, hidden_states: torch.Tensor):
             return 3.0 * hidden_states
@@ -1032,7 +1034,11 @@ def test_apertus2_decoder_layer_dispatches_kda_by_layer_types(
     assert isinstance(kda_layer.self_attn, FakeKDA)
     assert isinstance(softmax_layer.self_attn, Apertus2Attention)
     assert built == [
-        {"config": config, "vllm_config": vllm_config, "prefix": "model.layers.0.self_attn"}
+        {
+            "config": config,
+            "vllm_config": vllm_config,
+            "prefix": "model.layers.0.self_attn",
+        }
     ]
 
     # Norms are identity stubs: x -> x + 0.5 * 3x -> (2.5x) + 0.5 * (2.5x).
@@ -1069,7 +1075,9 @@ def test_apertus2_kda_architecture_registration() -> None:
     assert not hasattr(apertus2.Apertus2ForCausalLM, "is_hybrid")
     assert issubclass(apertus2.Apertus2KDAForCausalLM, apertus2.Apertus2ForCausalLM)
     packed = apertus2.Apertus2KDAForCausalLM.packed_modules_mapping
-    assert packed["in_proj_qkvgfab"] == ["q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"]
+    assert packed["in_proj_qkvgfab"] == [
+        "q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"
+    ]
     assert packed["conv1d"] == ["q_conv1d", "k_conv1d", "v_conv1d"]
     assert "in_proj_qkvgfab" not in apertus2.Apertus2ForCausalLM.packed_modules_mapping
 
@@ -1081,10 +1089,14 @@ def test_apertus2_kda_architecture_registration() -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="dist_init needs NCCL")
 @pytest.mark.parametrize("gate_bias", [True, False])
+@pytest.mark.parametrize("per_channel", [True, False])
 def test_apertus2_kda_attention_layer_matches_frozen_contract(
-    dist_init: None, gate_bias: bool
+    dist_init: None, gate_bias: bool, per_channel: bool
 ) -> None:
-    hf_config = _kda_hf_config(linear_attn_output_gate_bias=gate_bias)
+    hf_config = _kda_hf_config(
+        linear_attn_output_gate_bias=gate_bias,
+        linear_attn_a_log_per_channel=per_channel,
+    )
     vllm_config = _kda_vllm_config(hf_config)
     prefix = "model.layers.0.self_attn"
 
@@ -1099,6 +1111,21 @@ def test_apertus2_kda_attention_layer_matches_frozen_contract(
     assert layer.o_norm.eps == 1e-6 and layer.o_norm.activation == "sigmoid"
     assert (layer.g_b_proj.bias is not None) is gate_bias
     assert vllm_config.compilation_config.static_forward_context[prefix] is layer
+
+    a_log_size = 16 if per_channel else 2
+    expected_a_log = torch.arange(a_log_size, dtype=torch.bfloat16) / 16
+    assert layer.A_log.shape == (a_log_size,)
+    layer.A_log.weight_loader(layer.A_log, expected_a_log)
+    assert torch.equal(layer.A_log.data, expected_a_log.float())
+    with pytest.raises(ValueError, match="A_log expects"):
+        layer.A_log.weight_loader(layer.A_log, torch.zeros(2 if per_channel else 16))
+
+    # The flattened channel layout is head-major, so TP shards whole heads.
+    layer.tp_rank = 1
+    shard = nn.Parameter(torch.empty(a_log_size // 2))
+    layer.A_log.weight_loader(shard, expected_a_log)
+    assert torch.equal(shard.data, expected_a_log[a_log_size // 2:].float())
+    layer.tp_rank = 0
 
     # The layer and the model-level classmethods must size the cache alike.
     cls = apertus2.Apertus2KDAForCausalLM
