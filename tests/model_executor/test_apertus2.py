@@ -18,6 +18,42 @@ from vllm.model_executor.models.apertus2 import (
 )
 
 
+@pytest.mark.parametrize("correction_value", [None, 0.0, 1.0])
+def test_checkpoint_loader_accepts_only_zero_legacy_correction(
+    monkeypatch, correction_value
+) -> None:
+    class FakeLoader:
+        def __init__(self, module, **kwargs):
+            pass
+
+        def load_weights(self, weights, mapper=None):
+            return {name for name, tensor in weights}
+
+    monkeypatch.setattr(apertus2, "AutoWeightsLoader", FakeLoader)
+    model = apertus2.Apertus2ForCausalLM.__new__(apertus2.Apertus2ForCausalLM)
+    nn.Module.__init__(model)
+    model.config = SimpleNamespace(tie_word_embeddings=False)
+    beta_name = "model.layers.1.mlp.gate.qb_beta"
+    weights = [(beta_name, torch.tensor([0.13, -0.7]))]
+    if correction_value is not None:
+        weights.append(
+            (
+                "model.layers.1.mlp.gate.e_score_correction_bias",
+                torch.full((2,), correction_value),
+            )
+        )
+    if correction_value:
+        with pytest.raises(ValueError, match="nonzero legacy correction buffer"):
+            model.load_weights(iter(weights))
+    else:
+        assert model.load_weights(iter(weights)) == {beta_name}
+
+
+def test_moe_rejects_non_qb_checkpoint() -> None:
+    with pytest.raises(ValueError, match="only QB routing"):
+        apertus2.Apertus2MoE(SimpleNamespace(use_quantile_balancing=False))
+
+
 def _qb_reference(
     logits: torch.Tensor,
     qb_beta: torch.Tensor,
@@ -220,6 +256,7 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
     assert expert_args["apply_routed_scale_to_output"] is True
     assert expert_args["router_logits_dtype"] == torch.float32
     assert moe.gate.qb_beta.dtype == torch.float32
+    assert "e_score_correction_bias" not in dict(moe.gate.named_buffers())
 
     routing_call = {}
 
@@ -960,10 +997,10 @@ def test_remap_kda_checkpoint_keys_routes_only_kda_layers() -> None:
             f"model.layers.0.self_attn.{target}",
             shard,
         )
-    for leaf, (target, shard) in softmax_leaves.items():
+    for leaf, (target, softmax_shard) in softmax_leaves.items():
         expected[f"model.layers.1.self_attn.{leaf}"] = (
             f"model.layers.1.self_attn.{target}",
-            shard,
+            softmax_shard,
         )
     expected["model.layers.0.mlp.gate_proj.weight"] = (
         "model.layers.0.mlp.gate_up_proj.weight",
@@ -972,9 +1009,7 @@ def test_remap_kda_checkpoint_keys_routes_only_kda_layers() -> None:
     expected["model.embed_tokens.weight"] = ("model.embed_tokens.weight", None)
 
     tensors = {name: torch.empty(1) for name in expected}
-    remapped = apertus2.remap_kda_checkpoint_keys(
-        iter(tensors.items()), kda_layers={0}
-    )
+    remapped = apertus2.remap_kda_checkpoint_keys(iter(tensors.items()), kda_layers={0})
     mapped = list(apertus2.Apertus2KDAForCausalLM.hf_to_vllm_mapper.apply(remapped))
 
     assert len(mapped) == len(expected)
@@ -1076,7 +1111,11 @@ def test_apertus2_kda_architecture_registration() -> None:
     assert issubclass(apertus2.Apertus2KDAForCausalLM, apertus2.Apertus2ForCausalLM)
     packed = apertus2.Apertus2KDAForCausalLM.packed_modules_mapping
     assert packed["in_proj_qkvgfab"] == [
-        "q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj"
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "b_proj",
+        "f_a_proj",
     ]
     assert packed["conv1d"] == ["q_conv1d", "k_conv1d", "v_conv1d"]
     assert "in_proj_qkvgfab" not in apertus2.Apertus2ForCausalLM.packed_modules_mapping
@@ -1124,7 +1163,7 @@ def test_apertus2_kda_attention_layer_matches_frozen_contract(
     layer.tp_rank = 1
     shard = nn.Parameter(torch.empty(a_log_size // 2))
     layer.A_log.weight_loader(shard, expected_a_log)
-    assert torch.equal(shard.data, expected_a_log[a_log_size // 2:].float())
+    assert torch.equal(shard.data, expected_a_log[a_log_size // 2 :].float())
     layer.tp_rank = 0
 
     # The layer and the model-level classmethods must size the cache alike.
