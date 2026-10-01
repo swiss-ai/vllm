@@ -1,11 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-import re
 from collections.abc import Callable, Iterable
 from itertools import islice
 from types import SimpleNamespace
+from typing import cast
 
+import regex as re
 import torch
 from torch import nn
 from transformers.configuration_utils import PretrainedConfig
@@ -48,6 +49,7 @@ from vllm.model_executor.utils import maybe_disable_graph_partition, set_weight_
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.third_party.flash_linear_attention.ops.kda import FusedRMSNormGated
+from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 from vllm.utils.torch_utils import (
     LayerNameType,
     _encode_layer_name,
@@ -230,7 +232,9 @@ class Apertus2MoE(nn.Module):
         latent_size = getattr(config, "moe_latent_size", None)
         self.moe_hidden_size = latent_size or self.hidden_size
 
-        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
+        self.is_sequence_parallel = cast(
+            ParallelConfig, parallel_config
+        ).use_sequence_parallel_moe
 
         self.gate = GateLinear(
             input_size=self.hidden_size,
@@ -241,14 +245,11 @@ class Apertus2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         self.gate.register_buffer(
-            "e_score_correction_bias",
-            torch.zeros(self.n_routed_experts, dtype=torch.float32),
-        )
-        self.gate.register_buffer(
             "qb_beta",
             torch.zeros(self.n_routed_experts, dtype=torch.float32),
         )
 
+        self.shared_experts: Apertus2MLP | None
         if self.n_shared_experts:
             self.shared_experts = Apertus2MLP(
                 hidden_size=self.hidden_size,
@@ -265,6 +266,8 @@ class Apertus2MoE(nn.Module):
         else:
             self.shared_experts = None
 
+        self.latent_down_proj: ReplicatedLinear | None
+        self.latent_up_proj: ReplicatedLinear | None
         if latent_size:
             self.latent_down_proj = ReplicatedLinear(
                 input_size=self.hidden_size,
@@ -508,10 +511,13 @@ def kda_geometry(config: PretrainedConfig) -> tuple[int, int, int]:
             "KDA needs linear_key_head_dim == linear_value_head_dim, got "
             f"{fields['linear_key_head_dim']} != {fields['linear_value_head_dim']}."
         )
-    return (
-        fields["linear_num_value_heads"],
-        fields["linear_value_head_dim"],
-        fields["linear_conv_kernel_dim"],
+    return cast(
+        tuple[int, int, int],
+        (
+            fields["linear_num_value_heads"],
+            fields["linear_value_head_dim"],
+            fields["linear_conv_kernel_dim"],
+        ),
     )
 
 
@@ -562,11 +568,9 @@ class Apertus2KDAAttention(KimiGatedDeltaNetAttention):
                 "gate_lower_bound": gate_lower_bound,
             },
         )
-        super().__init__(kimi_view, vllm_config, prefix)
+        super().__init__(cast(KimiLinearConfig, kimi_view), vllm_config, prefix)
 
-        self.a_log_per_channel = getattr(
-            config, "linear_attn_a_log_per_channel", False
-        )
+        self.a_log_per_channel = getattr(config, "linear_attn_a_log_per_channel", False)
         if not isinstance(self.a_log_per_channel, bool):
             raise ValueError("linear_attn_a_log_per_channel must be a boolean")
         a_log_size = num_heads * (head_dim if self.a_log_per_channel else 1)
@@ -1014,7 +1018,19 @@ class Apertus2ForCausalLM(nn.Module, SupportsPP):
             self,
             skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        def qb_weights():
+            for name, tensor in weights:
+                if name.endswith(".mlp.gate.e_score_correction_bias"):
+                    if torch.count_nonzero(tensor):
+                        raise ValueError(
+                            "QB-only Apertus2 cannot discard nonzero legacy "
+                            f"correction buffer {name}"
+                        )
+                    continue
+                yield name, tensor
+
+        return loader.load_weights(qb_weights(), mapper=self.hf_to_vllm_mapper)
 
 
 # Checkpoint leaf -> (merged vLLM parameter, shard id) for KDA layers. The
