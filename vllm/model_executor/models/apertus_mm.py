@@ -13,12 +13,12 @@ from transformers import (
     Apertus1p5ImageProcessor,
     Apertus1p5Processor,
     Apertus1p5VisionTokenizerModel,
-    AutoConfig,
-    AutoModel,
     BatchFeature,
-    PreTrainedConfig,
 )
-from transformers.models.wavtokenizer import WavTokenizerFeatureExtractor
+from transformers.models.wavtokenizer import (
+    WavTokenizerEncoderModel,
+    WavTokenizerFeatureExtractor,
+)
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import (
@@ -111,15 +111,6 @@ def _pad_logits_to_input_vocab(
     )
 
 
-def _init_component_model(
-    component_config: PreTrainedConfig,
-    model_cls: type[torch.nn.Module] | None = None,
-) -> torch.nn.Module:
-    config_dict = component_config.to_dict()
-    config = AutoConfig.for_model(config_dict.pop("model_type"), **config_dict)
-    return AutoModel.from_config(config) if model_cls is None else model_cls(config)
-
-
 class Apertus1p5ProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self) -> Apertus1p5Config:
         return self.ctx.get_hf_config(Apertus1p5Config)
@@ -174,7 +165,10 @@ class Apertus1p5ProcessingInfo(BaseProcessingInfo):
             # Maximum image codes plus room for the image layout's wrapper
             # and row-separator tokens.
             "image": min(
-                (image_processor.max_pixels // (image_processor.spatial_factor**2))
+                (
+                    image_processor.size["max_pixels"]
+                    // (image_processor.spatial_factor**2)
+                )
                 + _IMAGE_TOKEN_BUDGET_OVERHEAD,
                 seq_len,
             ),
@@ -215,7 +209,7 @@ class Apertus1p5DummyInputsBuilder(BaseDummyInputsBuilder[Apertus1p5ProcessingIn
         audio_overrides = mm_options.get("audio")
         image_processor = self.info.get_image_processor()
         feature_extractor = self.info.get_feature_extractor()
-        max_image_side = isqrt(image_processor.max_pixels)
+        max_image_side = isqrt(image_processor.size["max_pixels"])
 
         return {
             "image": self._get_dummy_images(
@@ -279,7 +273,6 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
     ) -> Sequence[PromptUpdate]:
         del mm_items
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        image_processor = self.info.get_image_processor(**hf_processor_mm_kwargs)
         feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
 
@@ -288,14 +281,8 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             assert isinstance(pixel_values, torch.Tensor)
             height, width = pixel_values.shape[-2:]
             # Pixels were cropped to HF's per-image size before reaching here.
-            image_grids = [
-                [
-                    height // image_processor.spatial_factor,
-                    width // image_processor.spatial_factor,
-                ]
-            ]
             image_replacement = processor.replace_image_token(
-                {"image_grids": image_grids}, 0
+                {"image_sizes": [[height, width]]}, 0
             )
             image_ids = tokenizer.encode(image_replacement, add_special_tokens=False)
 
@@ -464,14 +451,11 @@ class Apertus1p5ForConditionalGeneration(
         if get_pp_group().is_first_rank:
             with set_default_torch_dtype(torch.float32):
                 with self._mark_tower_model(vllm_config, "image"):
-                    self.vision_tower = _init_component_model(
-                        config.vision_tokenizer_config,
-                        model_cls=Apertus1p5VisionTokenizerModel,
+                    self.vision_tower = Apertus1p5VisionTokenizerModel(
+                        config.vision_config
                     )
                 with self._mark_tower_model(vllm_config, "audio"):
-                    self.audio_tower = _init_component_model(
-                        config.audio_tokenizer_config,
-                    )
+                    self.audio_tower = WavTokenizerEncoderModel(config.audio_config)
 
         self.image_token_offset = getattr(
             config, "image_token_offset", _DEFAULT_IMAGE_TOKEN_OFFSET
@@ -539,7 +523,7 @@ class Apertus1p5ForConditionalGeneration(
         for image in images:
             image_codes = vision_tower.encode(
                 image.unsqueeze(0).to(device=target_device, dtype=target_dtype)
-            )
+            ).image_tokens
             ids_per_image.append(image_codes.flatten())
 
         ids_per_image = [
@@ -569,7 +553,8 @@ class Apertus1p5ForConditionalGeneration(
             audio_codes = audio_tower.encode(
                 audio.unsqueeze(0)
                 .unsqueeze(0)
-                .to(device=target_device, dtype=target_dtype)
+                .to(device=target_device, dtype=target_dtype),
+                return_dict=True,
             ).audio_codes
             ids_per_audio.append(audio_codes.squeeze(0).squeeze(0))
 
