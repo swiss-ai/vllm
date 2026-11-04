@@ -14,7 +14,11 @@ from transformers.configuration_utils import PretrainedConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.config.parallel import ParallelConfig
-from vllm.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_ep_group,
+    get_pp_group,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.distributed.communication_op import tensor_model_parallel_all_gather
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
@@ -57,7 +61,13 @@ from vllm.utils.torch_utils import (
     direct_register_custom_op,
 )
 
-from .interfaces import HasInnerState, IsHybrid, MambaStateShapes, SupportsPP
+from .interfaces import (
+    HasInnerState,
+    IsHybrid,
+    MambaStateShapes,
+    MixtureOfExperts,
+    SupportsPP,
+)
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -232,9 +242,8 @@ class Apertus2MoE(nn.Module):
         latent_size = getattr(config, "moe_latent_size", None)
         self.moe_hidden_size = latent_size or self.hidden_size
 
-        self.is_sequence_parallel = cast(
-            ParallelConfig, parallel_config
-        ).use_sequence_parallel_moe
+        parallel_config = cast(ParallelConfig, parallel_config)
+        self.is_sequence_parallel = parallel_config.use_sequence_parallel_moe
 
         self.gate = GateLinear(
             input_size=self.hidden_size,
@@ -303,6 +312,8 @@ class Apertus2MoE(nn.Module):
             is_sequence_parallel=self.is_sequence_parallel,
             apply_routed_scale_to_output=True,
             router_logits_dtype=torch.float32,
+            enable_eplb=parallel_config.enable_eplb,
+            num_redundant_experts=parallel_config.eplb_config.num_redundant_experts,
             prefix=f"{prefix}.experts",
         )
 
@@ -896,7 +907,7 @@ class Apertus2Model(nn.Module):
         return self.norm(hidden_states)
 
 
-class Apertus2ForCausalLM(nn.Module, SupportsPP):
+class Apertus2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     """Minimal native vLLM wrapper for Apertus 2 causal generation."""
 
     packed_modules_mapping = {
@@ -968,6 +979,42 @@ class Apertus2ForCausalLM(nn.Module, SupportsPP):
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
         )
+
+        self.moe_layers = [
+            layer.mlp.experts
+            for layer in self.model.layers
+            if isinstance(getattr(layer, "mlp", None), Apertus2MoE)
+        ]
+        self.expert_weights = []
+        self.num_moe_layers = len(self.moe_layers)
+        self.num_expert_groups = config.n_group
+        self.num_logical_experts = config.n_routed_experts
+        self.num_routed_experts = config.n_routed_experts
+        self.num_shared_experts = config.n_shared_experts
+        self.num_redundant_experts = (
+            vllm_config.parallel_config.eplb_config.num_redundant_experts
+        )
+        self.num_physical_experts = (
+            self.num_logical_experts + self.num_redundant_experts
+        )
+        if self.moe_layers:
+            routed_experts = self.moe_layers[0].routed_experts
+            self.num_local_physical_experts = routed_experts.local_num_experts
+        else:
+            self.num_local_physical_experts = (
+                self.num_physical_experts // get_ep_group().world_size
+            )
+
+    def update_physical_experts_metadata(
+        self,
+        num_physical_experts: int,
+        num_local_physical_experts: int,
+    ) -> None:
+        assert self.num_local_physical_experts == num_local_physical_experts
+        self.num_physical_experts = num_physical_experts
+        self.num_redundant_experts = num_physical_experts - self.num_logical_experts
+        for layer in self.moe_layers:
+            layer.update_expert_map()
 
     def _init_model(
         self,
