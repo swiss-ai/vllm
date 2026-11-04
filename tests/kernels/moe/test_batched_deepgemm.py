@@ -30,8 +30,9 @@ BLOCK_SIZE = [128, 128]
 @pytest.mark.parametrize("K", [128, 256])  # hidden dim
 @pytest.mark.parametrize("N", [512, 1024])  # intermediate dim per expert
 @pytest.mark.parametrize("topk", [2, 4])
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SSSGLU])
 def test_batched_deepgemm_vs_triton(
-    E: int, T: int, K: int, N: int, topk: int, monkeypatch, workspace_init
+    E: int, T: int, K: int, N: int, topk: int, activation, monkeypatch, workspace_init
 ):
     """Compare BatchedDeepGemmExperts to BatchedTritonExperts."""
     monkeypatch.setenv("VLLM_USE_DEEP_GEMM", "1")
@@ -87,7 +88,7 @@ def test_batched_deepgemm_vs_triton(
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation=activation,
         global_num_experts=E,
         expert_map=None,
         apply_router_weight_on_input=False,
@@ -111,7 +112,7 @@ def test_batched_deepgemm_vs_triton(
         w2=w2,
         topk_weights=topk_weights,
         topk_ids=topk_ids,
-        activation=MoEActivation.SILU,
+        activation=activation,
         global_num_experts=E,
         expert_map=None,
         apply_router_weight_on_input=False,

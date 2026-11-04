@@ -17,6 +17,9 @@ from vllm.model_executor.layers.fused_moe.topk_weight_and_reduce import (
     TopKWeightAndReduceDelegate,
 )
 from vllm.model_executor.layers.fused_moe.utils import _resize_cache
+from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+    per_token_group_quant_fp8,
+)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     get_fp8_min_max,
@@ -342,7 +345,7 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
 
     @staticmethod
     def _supports_activation(activation: MoEActivation) -> bool:
-        return activation == MoEActivation.SILU
+        return activation in (MoEActivation.SILU, MoEActivation.SSSGLU)
 
     @staticmethod
     def _supports_parallel_config(moe_parallel_config: FusedMoEParallelConfig) -> bool:
@@ -462,11 +465,23 @@ class BatchedDeepGemmExperts(mk.FusedMoEExpertsModular):
         )
 
         quant_scale_fmt = DeepGemmQuantScaleFMT.from_oracle()
-        a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
-            workspace1,
-            expert_num_tokens,
-            quant_scale_fmt=quant_scale_fmt,
-        )
+        if activation == MoEActivation.SILU:
+            a2q, a2q_scale = persistent_masked_m_silu_mul_quant(
+                workspace1,
+                expert_num_tokens,
+                quant_scale_fmt=quant_scale_fmt,
+            )
+        else:
+            # DeepGEMM handles scale packing/layout; GEMMs ignore padded rows.
+            act_out = _resize_cache(workspace2, (E * max_num_tokens, N // 2))
+            self.activation(activation, act_out, workspace1.view(-1, N))
+            a2q, a2q_scale = per_token_group_quant_fp8(
+                act_out,
+                self.block_shape[1],
+                use_ue8m0=quant_scale_fmt != DeepGemmQuantScaleFMT.FLOAT32,
+            )
+            a2q = a2q.view(E, max_num_tokens, N // 2)
+            a2q_scale = a2q_scale.view(E, max_num_tokens, -1)
 
         fp8_m_grouped_gemm_nt_masked(
             (a2q, a2q_scale),

@@ -158,7 +158,7 @@ def make_block_quant_fp8_weights(
     return w1, w2, w1_s, w2_s
 
 
-def run_single_case(m, n, k, topk, num_experts, block_size):
+def run_single_case(m, n, k, topk, num_experts, block_size, activation):
     """Run one (M,N,K) configuration on a single GPU and assert DeepGEMM ==
     Triton baseline within tolerance.
     """
@@ -205,6 +205,7 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         quant_config=quant_config,
+        activation=activation,
     )
 
     # DeepGemm
@@ -215,7 +216,7 @@ def run_single_case(m, n, k, topk, num_experts, block_size):
         topk_weights=topk_weights,
         topk_ids=topk_ids,
         global_num_experts=num_experts,
-        activation=MoEActivation.SILU,
+        activation=activation,
         apply_router_weight_on_input=False,
         expert_map=None,
     )
@@ -235,11 +236,14 @@ TOPKS = [2, 6]
 NUM_EXPERTS = [32]
 
 
+@pytest.mark.parametrize("activation", [MoEActivation.SILU, MoEActivation.SSSGLU])
 @pytest.mark.parametrize(("m", "n", "k"), MNKs)
 @pytest.mark.parametrize("topk", TOPKS)
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.skipif(not is_deep_gemm_supported(), reason="Requires deep_gemm kernels")
-def test_deepgemm_vs_triton(m, n, k, topk, num_experts, monkeypatch, workspace_init):
+def test_deepgemm_vs_triton(
+    m, n, k, topk, num_experts, activation, monkeypatch, workspace_init
+):
     with monkeypatch.context() as mp:
         mp.setenv("VLLM_USE_DEEP_GEMM", "1")
 
@@ -266,6 +270,7 @@ def test_deepgemm_vs_triton(m, n, k, topk, num_experts, monkeypatch, workspace_i
             topk=topk,
             num_experts=num_experts,
             block_size=BLOCK_SIZE,
+            activation=activation,
         )
 
         # ensure that the DeepGEMM path was indeed taken.
