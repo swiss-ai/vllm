@@ -826,14 +826,8 @@ class Apertus2Model(nn.Module):
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
         parallel_config = vllm_config.parallel_config
-        if quant_config is not None:
-            raise ValueError(
-                "Apertus2 currently supports only unquantized BF16 inference."
-            )
         if vllm_config.model_config.dtype != torch.bfloat16:
-            raise ValueError(
-                "Apertus2 currently supports only unquantized BF16 inference."
-            )
+            raise ValueError("Apertus2 requires BF16 model dtype.")
 
         self.config = config
         self.quant_config = quant_config
