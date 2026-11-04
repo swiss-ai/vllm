@@ -235,7 +235,11 @@ def test_apertus2_moe_wires_qb_latent_and_shared_paths(
     )
     moe = apertus2.Apertus2MoE(
         config,
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=False,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
         prefix="model.layers.1.mlp",
     )
     gate_args = captured["gate"]
@@ -384,7 +388,11 @@ def _make_stubbed_moe(
         config.moe_router_quantile_balancing_method = qb_method
     return apertus2.Apertus2MoE(
         config,
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=sequence_parallel),
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=sequence_parallel,
+            enable_eplb=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
         prefix="model.layers.1.mlp",
     )
 
@@ -738,12 +746,18 @@ def _model_vllm_config(
         rms_norm_eps=1e-5,
         tie_word_embeddings=tie_word_embeddings,
         embedding_multiplier=1.0,
+        n_routed_experts=4,
+        n_shared_experts=1,
+        n_group=1,
     )
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_config=hf_config, dtype=dtype),
         cache_config=None,
         quant_config=quant_config,
-        parallel_config=SimpleNamespace(use_sequence_parallel_moe=False),
+        parallel_config=SimpleNamespace(
+            use_sequence_parallel_moe=False,
+            eplb_config=SimpleNamespace(num_redundant_experts=0),
+        ),
         compilation_config=SimpleNamespace(mode=CompilationMode.NONE),
     )
 
@@ -773,6 +787,7 @@ def test_apertus2_lm_head_ties_and_loader_skips_when_tied(
         def __init__(self) -> None:
             super().__init__()
             self.embed_tokens = embed_tokens
+            self.layers = nn.ModuleList()
             self.make_empty_intermediate_tensors = lambda *a, **k: None
 
     class FakeLMHead(nn.Module):
@@ -807,6 +822,7 @@ def test_apertus2_lm_head_ties_and_loader_skips_when_tied(
         apertus2, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True)
     )
     monkeypatch.setattr(apertus2, "AutoWeightsLoader", FakeLoader)
+    monkeypatch.setattr(apertus2, "get_ep_group", lambda: SimpleNamespace(world_size=1))
 
     model = apertus2.Apertus2ForCausalLM(vllm_config=config)
 
