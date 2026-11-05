@@ -748,16 +748,63 @@ def _model_vllm_config(
     )
 
 
-@pytest.mark.parametrize(
-    ("config", "message"),
-    [
-        (_model_vllm_config(quant_config=object()), "unquantized BF16"),
-        (_model_vllm_config(dtype=torch.float16), "unquantized BF16"),
-    ],
-)
-def test_apertus2_model_rejects_unsupported_modes(config, message: str) -> None:
-    with pytest.raises(ValueError, match=message):
-        apertus2.Apertus2Model(vllm_config=config)
+def test_apertus2_model_rejects_fp16_dtype() -> None:
+    with pytest.raises(ValueError, match="requires BF16 model dtype"):
+        apertus2.Apertus2Model(vllm_config=_model_vllm_config(dtype=torch.float16))
+
+
+@pytest.mark.parametrize("quantization", ["none", "online", "offline"])
+def test_apertus2_model_forwards_quantization_config(monkeypatch, quantization) -> None:
+    from vllm.config.quantization import QuantizationConfigArgs, QuantSpec
+    from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+    from vllm.model_executor.layers.quantization.online.base import (
+        OnlineQuantizationConfig,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kFp8Static128BlockSym,
+    )
+
+    quant_config = {
+        "none": None,
+        "online": OnlineQuantizationConfig(
+            QuantizationConfigArgs(moe=QuantSpec(weight=kFp8Static128BlockSym))
+        ),
+        "offline": Fp8Config(
+            is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+        ),
+    }[quantization]
+    received = []
+
+    class FakeEmbedding(nn.Module):
+        def __init__(self, *args, quant_config=None, **kwargs):
+            super().__init__()
+            received.append(quant_config)
+
+    class FakeLayer(nn.Module):
+        def __init__(self, *, quant_config, **kwargs):
+            super().__init__()
+            received.append(quant_config)
+
+    def fake_make_layers(num_layers, layer_fn, *, prefix):
+        layers = nn.ModuleList(layer_fn(f"{prefix}.{idx}") for idx in range(num_layers))
+        return 0, num_layers, layers
+
+    monkeypatch.setattr(
+        apertus2,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(apertus2, "VocabParallelEmbedding", FakeEmbedding)
+    monkeypatch.setattr(apertus2, "make_layers", fake_make_layers)
+    monkeypatch.setattr(apertus2, "RMSNorm", lambda *args, **kwargs: nn.Identity())
+    model = apertus2.Apertus2Model(
+        vllm_config=_model_vllm_config(quant_config=quant_config),
+        layer_type=FakeLayer,
+    )
+
+    assert model.quant_config is quant_config
+    assert len(received) == 3  # Embedding and both decoder layers.
+    assert all(config is quant_config for config in received)
 
 
 @pytest.mark.parametrize("tied", [True, False])
