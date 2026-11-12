@@ -65,9 +65,9 @@ def _kda_gate_beta_fwd_kernel(
         b_g += b_bias[None, :]
 
     if A_PER_CHANNEL:
-        b_a = exp(tl.load(
-            A_log + i_h * D + o_d, mask=m_d, other=0.0
-        ).to(tl.float32))[None, :]
+        b_a = exp(tl.load(A_log + i_h * D + o_d, mask=m_d, other=0.0).to(tl.float32))[
+            None, :
+        ]
     else:
         b_a = exp(tl.load(A_log + i_h).to(tl.float32))
     if USE_LOWER_BOUND:
@@ -259,9 +259,9 @@ def fused_recurrent_kda_fwd_kernel(
                 ).to(tl.float32)
                 b_gate += b_bias
             if A_PER_CHANNEL:
-                b_a = exp(tl.load(
-                    A_log + i_h * K + o_k, mask=m_k, other=0.0
-                ).to(tl.float32))
+                b_a = exp(
+                    tl.load(A_log + i_h * K + o_k, mask=m_k, other=0.0).to(tl.float32)
+                )
             else:
                 b_a = exp(tl.load(A_log + i_h).to(tl.float32))
             if USE_LOWER_BOUND:
@@ -574,9 +574,7 @@ def fused_recurrent_kda_packed_decode_kernel(
     b_g = tl.load(p_g, mask=mask_k, other=0).to(tl.float32)
     b_bias = tl.load(dt_bias + i_h * K + o_k, mask=mask_k, other=0).to(tl.float32)
     if A_PER_CHANNEL:
-        b_a = exp(tl.load(
-            A_log + i_h * K + o_k, mask=mask_k, other=0.0
-        ).to(tl.float32))
+        b_a = exp(tl.load(A_log + i_h * K + o_k, mask=mask_k, other=0.0).to(tl.float32))
     else:
         b_a = exp(tl.load(A_log + i_h).to(tl.float32))
     b_g += b_bias

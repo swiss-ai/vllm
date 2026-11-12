@@ -416,9 +416,10 @@ def test_packed_kda_decode_correctness(
         device=DEVICE,
     )
     beta = raw_beta.float().sigmoid()
-    A_log = torch.randn(
-        H * D if per_channel else H, dtype=torch.float32, device=DEVICE
-    ) * 0.5
+    A_log = (
+        torch.randn(H * D if per_channel else H, dtype=torch.float32, device=DEVICE)
+        * 0.5
+    )
     dt_bias = torch.randn(H, D, dtype=torch.float32, device=DEVICE) * 0.1
     state_storage = torch.randn(
         num_seqs + 1,

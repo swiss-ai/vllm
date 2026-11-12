@@ -512,9 +512,9 @@ def kda_gate_chunk_cumsum_vector_kernel(
 
     if A_PER_CHANNEL:
         o_s = i_s * BS + tl.arange(0, BS)
-        b_a = tl.exp(tl.load(
-            A_log + i_h * S + o_s, mask=o_s < S, other=0.0
-        ).to(tl.float32))[None, :]
+        b_a = tl.exp(
+            tl.load(A_log + i_h * S + o_s, mask=o_s < S, other=0.0).to(tl.float32)
+        )[None, :]
     else:
         b_a = tl.exp(tl.load(A_log + i_h).to(tl.float32))
     if USE_LOWER_BOUND:
@@ -870,9 +870,9 @@ def kda_gate_fwd_kernel(
 
     if A_PER_CHANNEL:
         o_d = tl.arange(0, BD)
-        b_a = tl.exp(tl.load(
-            A + i_h * D + o_d, mask=o_d < D, other=0.0
-        ).to(tl.float32))[None, :]
+        b_a = tl.exp(
+            tl.load(A + i_h * D + o_d, mask=o_d < D, other=0.0).to(tl.float32)
+        )[None, :]
     else:
         b_a = tl.exp(tl.load(A + i_h).to(tl.float32))
 
