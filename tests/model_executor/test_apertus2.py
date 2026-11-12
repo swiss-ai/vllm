@@ -849,11 +849,10 @@ def test_apertus2_lm_head_ties_and_loader_skips_when_tied(
             self.tied_to = embed
             return tied_head
 
-    captured: dict[str, Any] = {}
-
     class FakeLoader:
-        def __init__(self, module: Any, *, skip_prefixes: Any = None) -> None:
-            captured["skip_prefixes"] = skip_prefixes
+        # Tied lm_head aliases are skipped by AutoWeightsLoader itself.
+        def __init__(self, module: Any) -> None:
+            pass
 
         def load_weights(self, weights: Any, mapper: Any = None) -> set[str]:
             return set()
@@ -883,7 +882,6 @@ def test_apertus2_lm_head_ties_and_loader_skips_when_tied(
         assert FakeLMHead.last.tied_to is None
 
     assert model.load_weights(iter([])) == set()
-    assert captured["skip_prefixes"] == (["lm_head."] if tied else None)
 
 
 @pytest.mark.parametrize(
