@@ -347,9 +347,10 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             image_sizes = processed_outputs["image_sizes"]
             assert isinstance(image_sizes, torch.Tensor)
             # Apertus1p5 input-processor pads images to a common request size.
-            # Cache each image without that request-dependent padding.
+            # Cache a copy of each image without that request-dependent padding;
+            # a view would keep the whole padded batch alive.
             processed_outputs["pixel_values"] = [
-                image[:, : int(height), : int(width)].contiguous()
+                image[:, : int(height), : int(width)].clone()
                 for image, (height, width) in zip(pixel_values, image_sizes)
             ]
 
@@ -357,9 +358,9 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             input_values = processed_outputs["input_values"]
             padding_mask = processed_outputs["padding_mask"]
             # Apertus1p5 input-processor pads audio to a common request size.
-            # Cache each clip without that request-dependent padding.
+            # Cache a copy of each clip without that request-dependent padding.
             processed_outputs["audio_values"] = [
-                audio[0, : int(mask.sum())].contiguous()
+                audio[0, : int(mask.sum())].clone()
                 for audio, mask in zip(input_values, padding_mask)
             ]
 
