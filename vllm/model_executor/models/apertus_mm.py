@@ -273,7 +273,6 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
     ) -> Sequence[PromptUpdate]:
         del mm_items
         processor = self.info.get_hf_processor(**hf_processor_mm_kwargs)
-        feature_extractor = self.info.get_feature_extractor(**hf_processor_mm_kwargs)
         tokenizer = self.info.get_tokenizer()
 
         def get_image_replacement(item_idx: int) -> PromptUpdateDetails:
@@ -291,12 +290,11 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
         def get_audio_replacement(item_idx: int) -> PromptUpdateDetails:
             audio_values = out_mm_kwargs["audio"][item_idx]["audio_values"].data
             assert isinstance(audio_values, torch.Tensor)
-            # Use HF's code-count calculation so cache replay follows HF exactly.
-            num_audio_codes = feature_extractor.get_num_audio_codes(
-                audio_values.shape[-1]
-            )
+            # HF counts the codes from the padding mask, so cache replay follows
+            # HF exactly. Cached clips are unpadded: every sample is valid.
+            padding_mask = torch.ones(audio_values.shape[-1], dtype=torch.bool)
             audio_replacement = processor.replace_audio_token(
-                {"num_audio_codes": [num_audio_codes]}, 0
+                {"padding_mask": [padding_mask]}, 0
             )
             audio_ids = tokenizer.encode(audio_replacement, add_special_tokens=False)
 
@@ -349,20 +347,21 @@ class Apertus1p5MultiModalProcessor(BaseMultiModalProcessor[Apertus1p5Processing
             image_sizes = processed_outputs["image_sizes"]
             assert isinstance(image_sizes, torch.Tensor)
             # Apertus1p5 input-processor pads images to a common request size.
-            # Cache each image without that request-dependent padding.
+            # Cache a copy of each image without that request-dependent padding;
+            # a view would keep the whole padded batch alive.
             processed_outputs["pixel_values"] = [
-                image[:, : int(height), : int(width)].contiguous()
+                image[:, : int(height), : int(width)].clone()
                 for image, (height, width) in zip(pixel_values, image_sizes)
             ]
 
-        if "input_features" in processed_outputs:
-            input_features = processed_outputs["input_features"]
-            attention_mask = processed_outputs["feature_attention_mask"]
+        if "input_values" in processed_outputs:
+            input_values = processed_outputs["input_values"]
+            padding_mask = processed_outputs["padding_mask"]
             # Apertus1p5 input-processor pads audio to a common request size.
-            # Cache each feature without that request-dependent padding.
+            # Cache a copy of each clip without that request-dependent padding.
             processed_outputs["audio_values"] = [
-                audio[0, : int(mask.sum())].contiguous()
-                for audio, mask in zip(input_features, attention_mask)
+                audio[0, : int(mask.sum())].clone()
+                for audio, mask in zip(input_values, padding_mask)
             ]
 
         return processed_outputs
