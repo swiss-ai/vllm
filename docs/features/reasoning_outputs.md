@@ -45,6 +45,14 @@ vLLM currently supports the following reasoning models:
     Ripple decides per turn whether to reason and has no switch for it. Structured outputs apply from the first token, so constrained responses answer without reasoning.
     Kolibri 1 reasoning is enabled by default. To disable it, set `reasoning_effort="none"` or pass `enable_thinking=False` in your `chat_template_kwargs`.
 
+For Apertus models, use `--reasoning-parser apertus`. The parser supports
+`<|inner_prefix|>` / `<|inner_suffix|>` and `<think>` / `</think>`. It selects
+the pair with the lower start-token ID in the loaded tokenizer. It reads the
+prompt tokens to detect a thinking section left open by the chat template.
+To parse tool calls inside thinking, also use `--tool-call-parser apertus`
+and `--enable-auto-tool-choice`. A `<|tools_prefix|>` token ends reasoning
+and passes the call to the tool parser, even without a reasoning-end token.
+
 ## Quickstart
 
 To use reasoning models, you need to specify the `--reasoning-parser` flags when making a request to the chat completion endpoint. The `--reasoning-parser` flag specifies the reasoning parser to use for extracting reasoning content from the model output.
