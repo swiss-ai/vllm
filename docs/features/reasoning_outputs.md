@@ -14,7 +14,7 @@ vLLM currently supports the following reasoning models:
 
 | Model Series | Parser Name | Structured Output Support | Tool Calling |
 | ------------ | ----------- | ---------------- | ----------- |
-| [Apertus series](https://huggingface.co/collections/swiss-ai/apertus-v15) | `apertus` | `json`, `regex` | ✅ |
+| [Apertus 1.5](https://huggingface.co/collections/swiss-ai/apertus-v15) | `apertus` | See below | Non-thinking mode |
 | [Cohere Command A Reasoning](https://huggingface.co/CohereLabs/command-a-reasoning-08-2025) | `cohere_command3` | `json`, `regex` | ✅ |
 | [Cohere Command A Plus](https://huggingface.co/CohereLabs/command-a-plus-05-2026-bf16) | `cohere_command4` | `json`, `regex` | ✅ |
 | [DeepSeek R1 series](https://huggingface.co/collections/deepseek-ai/deepseek-r1-678e1e131c0169c0bc89728d) | `deepseek_r1` | `json`, `regex` | ❌ |
@@ -45,13 +45,16 @@ vLLM currently supports the following reasoning models:
     Ripple decides per turn whether to reason and has no switch for it. Structured outputs apply from the first token, so constrained responses answer without reasoning.
     Kolibri 1 reasoning is enabled by default. To disable it, set `reasoning_effort="none"` or pass `enable_thinking=False` in your `chat_template_kwargs`.
 
-For Apertus models, use `--reasoning-parser apertus`. The parser supports
-`<|inner_prefix|>` / `<|inner_suffix|>` and `<think>` / `</think>`. It selects
-the pair with the lower start-token ID in the loaded tokenizer. It reads the
-prompt tokens to detect a thinking section left open by the chat template.
-To parse tool calls inside thinking, also use `--tool-call-parser apertus`
-and `--enable-auto-tool-choice`. A `<|tools_prefix|>` token ends reasoning
-and passes the call to the tool parser, even without a reasoning-end token.
+For Apertus 1.5, use `--reasoning-parser apertus` to extract reasoning. The chat
+template defaults to `enable_thinking=false`. To enable thinking by default, pass
+`--default-chat-template-kwargs.enable_thinking true` when you start the server.
+To enable it for one request, set `enable_thinking` to `true` in
+`chat_template_kwargs`.
+
+Use non-thinking mode for tool calling with `--tool-call-parser apertus` and
+`--enable-auto-tool-choice`. By default, structured output constraints wait for
+the end of reasoning when `include_reasoning` is enabled. An answer without a
+reasoning boundary can bypass those constraints.
 
 ## Quickstart
 

@@ -51,6 +51,10 @@ def test_emitted_delimiters(active, inactive, streaming):
         "Thought",
         answer,
     )
+    assert run_reasoning_extraction(
+        ApertusReasoningParser(tokenizer), [answer], streaming=streaming
+    ) == (None, answer)
+
     completed_reasoning_ids = tokenizer.encode("".join(output[:3]))
     if streaming:
         assert parser.is_reasoning_end_streaming(
@@ -98,11 +102,16 @@ def test_prompt_controls_reasoning(
 def test_tool_call_ends_reasoning(apertus_tokenizer):
     parser = ApertusReasoningParser(apertus_tokenizer)
     call = TOOLS_START + TOOL_PAYLOAD + TOOLS_END
+    output = INNER[0] + "Thought" + call
 
-    assert run_reasoning_extraction(parser, [INNER[0], "Thought", call]) == (
+    assert run_reasoning_extraction(parser, [output]) == (
         "Thought",
         call,
     )
+    call_ids = apertus_tokenizer.encode(call)
+    output_ids = apertus_tokenizer.encode(output)
+    assert parser.is_reasoning_end_streaming(output_ids, call_ids)
+    assert parser.extract_content_ids(output_ids) == call_ids
 
 
 def test_streaming_reasoning_to_tool_handoff(apertus_tokenizer):
