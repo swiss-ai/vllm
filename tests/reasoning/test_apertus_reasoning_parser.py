@@ -114,7 +114,14 @@ def test_tool_call_ends_reasoning(apertus_tokenizer):
     assert parser.extract_content_ids(output_ids) == call_ids
 
 
-def test_streaming_reasoning_to_tool_handoff(apertus_tokenizer):
+@pytest.mark.parametrize(
+    "prompt, start_chunks",
+    [
+        pytest.param("", [INNER[0]], id="generated-open"),
+        pytest.param(ASSISTANT_START + INNER[0], [], id="prompt-open"),
+    ],
+)
+def test_streaming_reasoning_to_tool_handoff(apertus_tokenizer, prompt, start_chunks):
     parser_cls = ParserManager.get_parser(
         reasoning_parser_name="apertus",
         tool_parser_name="apertus",
@@ -128,14 +135,15 @@ def test_streaming_reasoning_to_tool_handoff(apertus_tokenizer):
         tool_choice="auto",
     )
     parser = parser_cls(apertus_tokenizer, tools=request.tools)
-    chunks = [INNER[0], "Thought", TOOLS_START, TOOL_PAYLOAD, TOOLS_END]
+    prompt_token_ids = apertus_tokenizer.encode(prompt, add_special_tokens=False)
+    chunks = [*start_chunks, "Thought", TOOLS_START, TOOL_PAYLOAD, TOOLS_END]
     deltas = []
     for i, chunk in enumerate(chunks):
         delta = parser.parse_delta(
             chunk,
             apertus_tokenizer.encode(chunk, add_special_tokens=False),
             request,
-            prompt_token_ids=[] if i == 0 else None,
+            prompt_token_ids=prompt_token_ids if i == 0 else None,
             finished=i == len(chunks) - 1,
         )
         if delta is not None:
@@ -166,3 +174,41 @@ def test_answer_after_tool_result(apertus_tokenizer):
         None,
         "The weather is sunny.",
     )
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        pytest.param(ASSISTANT_START, id="fresh-turn"),
+        pytest.param(ASSISTANT_START + INNER[0], id="prompt-open"),
+    ],
+)
+def test_streaming_answer_after_tool_result(apertus_tokenizer, prompt):
+    parser_cls = ParserManager.get_parser(
+        reasoning_parser_name="apertus",
+        tool_parser_name="apertus",
+        enable_auto_tools=True,
+    )
+    assert parser_cls is not None
+    request = ChatCompletionRequest(
+        model="test-model",
+        messages=[{"role": "tool", "tool_call_id": "call_1", "content": "sunny"}],
+        tools=[{"type": "function", "function": {"name": "get_weather"}}],
+        tool_choice="auto",
+    )
+    parser = parser_cls(apertus_tokenizer, tools=request.tools)
+    prompt_token_ids = apertus_tokenizer.encode(prompt, add_special_tokens=False)
+    chunks = ["It", " is", " sunny"]
+    content = []
+    for i, chunk in enumerate(chunks):
+        delta = parser.parse_delta(
+            chunk,
+            apertus_tokenizer.encode(chunk, add_special_tokens=False),
+            request,
+            prompt_token_ids=prompt_token_ids if i == 0 else None,
+            finished=i == len(chunks) - 1,
+        )
+        if delta is not None and delta.content:
+            content.append(delta.content)
+
+    assert "".join(content) == "It is sunny"

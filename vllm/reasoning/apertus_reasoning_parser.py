@@ -178,10 +178,11 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
     def get_streaming_fallback_content(
         self, previous_text: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> str | None:
-        """The stream ended inside the reasoning phase: after a tool result, text
-        with no reasoning start and no call is the model's answer."""
+        """Recover an unmarked post-tool answer from prompt-open reasoning."""
+        # A fresh turn already streams unmarked text as content.
         if (
-            not _after_tool(request)
+            not self.open_from_prompt
+            or not _after_tool(request)
             or self.start_token in previous_text
             or TOOLS_PREFIX in previous_text
         ):
