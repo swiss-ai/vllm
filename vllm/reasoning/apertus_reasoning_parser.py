@@ -4,7 +4,7 @@
 
 from collections.abc import Iterable, Sequence
 from functools import cached_property
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
 from vllm.reasoning.basic_parsers import BaseThinkingReasoningParser
@@ -14,9 +14,12 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
+INNER_PREFIX, INNER_SUFFIX = "<|inner_prefix|>", "<|inner_suffix|>"
+THINKING_START, THINKING_END = "<think>", "</think>"
+
 _CANDIDATE_PAIRS = (
-    ("<|inner_prefix|>", "<|inner_suffix|>"),
-    ("<think>", "</think>"),
+    (INNER_PREFIX, INNER_SUFFIX),
+    (THINKING_START, THINKING_END),
 )
 
 TOOLS_PREFIX = "<|tools_prefix|>"
@@ -74,7 +77,9 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
     def end_token(self) -> str:
         return self._delimiter_pair[1]
 
-    def _last_marker(self, input_ids: Sequence[int]) -> str:
+    def _get_last_marker(
+        self, input_ids: Sequence[int]
+    ) -> Literal["open", "closed", "turn"]:
         for token_id in reversed(input_ids):
             if token_id == self.end_token_id:
                 return "closed"
@@ -86,10 +91,10 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
 
     def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # A new assistant turn can emit its own reasoning start.
-        return self._last_marker(input_ids) == "closed"
+        return self._get_last_marker(input_ids) == "closed"
 
     def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
-        self.open_from_prompt = self._last_marker(prompt_token_ids) == "open"
+        self.open_from_prompt = self._get_last_marker(prompt_token_ids) == "open"
 
     def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
         self.set_prompt_token_ids(prompt_token_ids)

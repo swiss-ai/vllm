@@ -11,10 +11,16 @@ from transformers import TokenizersBackend
 from tests.reasoning.utils import run_reasoning_extraction
 from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionRequest
 from vllm.parser import ParserManager
-from vllm.reasoning.apertus_reasoning_parser import ApertusReasoningParser
+from vllm.reasoning.apertus_reasoning_parser import (
+    INNER_PREFIX,
+    INNER_SUFFIX,
+    THINKING_END,
+    THINKING_START,
+    ApertusReasoningParser,
+)
 
-INNER = ("<|inner_prefix|>", "<|inner_suffix|>")
-THINK = ("<think>", "</think>")
+INNER = (INNER_PREFIX, INNER_SUFFIX)
+THINK = (THINKING_START, THINKING_END)
 ASSISTANT_START = "<|assistant_start|>"
 TOOLS_START, TOOLS_END = "<|tools_prefix|>", "<|tools_suffix|>"
 TOOL_PAYLOAD = '[{"get_weather": {"city": "Bern"}}]'
