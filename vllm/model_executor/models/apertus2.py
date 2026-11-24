@@ -1055,10 +1055,7 @@ class Apertus2ForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
         self,
         weights: Iterable[tuple[str, torch.Tensor]],
     ) -> set[str]:
-        loader = AutoWeightsLoader(
-            self,
-            skip_prefixes=(["lm_head."] if self.config.tie_word_embeddings else None),
-        )
+        loader = AutoWeightsLoader(self)
 
         def qb_weights():
             for name, tensor in weights:
