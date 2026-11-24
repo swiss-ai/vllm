@@ -259,8 +259,8 @@ _TOOL_PARSERS_TO_REGISTER = {
         "Gemma4EngineToolParser",
     ),
     "apertus": (
-        "apertus_tool_parser",
-        "ApertusToolParser",
+        "apertus_engine_tool_parser",
+        "ApertusParserToolAdapter",
     ),
     "zaya": (
         "zaya_engine_tool_parser",

@@ -7,6 +7,7 @@ names so that `ReasoningParserManager` and
 `ToolParserManager` can load them lazily.
 """
 
+from vllm.parser.apertus import ApertusParser
 from vllm.parser.deepseek_v4 import DeepSeekV4Parser
 from vllm.parser.deepseek_v32 import DeepSeekV32Parser
 from vllm.parser.deepseek_v41 import DeepSeekV41Parser
@@ -31,6 +32,11 @@ from vllm.parser.ripple import RippleParser
 from vllm.parser.seed_oss import SeedOssParser
 from vllm.parser.step3p5 import Step3p5Parser
 from vllm.parser.zaya import ZayaParser
+
+(
+    ApertusParserReasoningAdapter,
+    ApertusParserToolAdapter,
+) = make_adapters(ApertusParser)
 
 (
     DeepSeekV32ParserReasoningAdapter,

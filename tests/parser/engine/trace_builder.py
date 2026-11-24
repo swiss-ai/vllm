@@ -31,6 +31,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
 )
 from vllm.parser import plamo3
 from vllm.parser.engine.registered_adapters import (
+    ApertusParser,
     DeepSeekV4Parser,
     DeepSeekV32Parser,
     DeepSeekV41Parser,
@@ -1462,9 +1463,64 @@ _GRANITE_SCENARIOS: list[Scenario] = [
 ]
 
 
+# ── Apertus (deliberation block, JSON array of {name: arguments}) ────
+
+_APERTUS_VOCAB: dict[str, int] = {
+    "<|inner_prefix|>": 32,
+    "<|inner_suffix|>": 33,
+    "<|tools_prefix|>": 34,
+    "<|tools_suffix|>": 35,
+    "<|tool_output_end|>": 36,
+}
+
+
+def _apertus_tools_segments(tool_calls: list[ToolCallSpec]) -> list[tuple[str, bool]]:
+    payload = json.dumps(
+        [{tc.name: tc.arguments} for tc in tool_calls], ensure_ascii=False
+    )
+    return [("<|tools_prefix|>", True), (payload, False), ("<|tools_suffix|>", True)]
+
+
+def _apertus_segments(scenario: Scenario) -> list[tuple[str, bool]]:
+    segs: list[tuple[str, bool]] = []
+    if scenario.reasoning is not None:
+        segs += [("<|inner_prefix|>", True), (scenario.reasoning, False)]
+        # Apertus calls tools from inside its deliberation, without closing it.
+        if scenario.content is not None or not scenario.tool_calls:
+            segs.append(("<|inner_suffix|>", True))
+    if scenario.tool_calls is not None and not scenario.tool_calls:
+        segs += _apertus_tools_segments([])
+    if scenario.content is not None:
+        segs.append((scenario.content, False))
+    if scenario.tool_calls:
+        segs += _apertus_tools_segments(scenario.tool_calls)
+    return segs
+
+
+def _build_apertus(scenario: Scenario, validate: bool = True) -> Sample:
+    prompt_token_ids = None
+    if scenario.after_tool_response:
+        prompt_token_ids = [_APERTUS_VOCAB["<|tool_output_end|>"]]
+    sample = _make_sample(
+        sample_id=f"apertus-{scenario.id}",
+        description=scenario.description,
+        vocab=_APERTUS_VOCAB,
+        segments=_apertus_segments(scenario),
+        expected_reasoning=scenario.reasoning,
+        expected_content=_qwen3_expected_content(scenario),
+        expected_tool_calls=_expected_tc(scenario),
+        tools=_expected_tools(scenario),
+        prompt_token_ids=prompt_token_ids,
+    )
+    if validate:
+        _validate_sample(sample, ApertusParser)
+    return sample
+
+
 # ── Registry and public API ──────────────────────────────────────────
 
 _BUILDERS: dict[str, Any] = {
+    "apertus": _build_apertus,
     "deepseek_v32": _build_deepseek_v32,
     "deepseek_v4": _build_deepseek_v4,
     "deepseek_v41": functools.partial(_build_deepseek_v4, v41=True),
