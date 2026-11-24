@@ -42,16 +42,9 @@ vLLM currently supports the following reasoning models:
     Holo2 reasoning is enabled by default. To disable it, you must also pass `thinking=False` in your `chat_template_kwargs`.
     Kolibri 1 reasoning is enabled by default. To disable it, set `reasoning_effort="none"` or pass `enable_thinking=False` in your `chat_template_kwargs`.
 
-For Apertus 1.5, use `--reasoning-parser apertus` to extract reasoning. The chat
-template defaults to `enable_thinking=false`. To enable thinking by default, pass
-`--default-chat-template-kwargs.enable_thinking true` when you start the server.
-To enable it for one request, set `enable_thinking` to `true` in
-`chat_template_kwargs`.
+For Apertus 1.5, use `--reasoning-parser apertus` to extract reasoning. The chat template defaults to `enable_thinking=false`. To enable thinking by default, pass `--default-chat-template-kwargs.enable_thinking true` when you start the server. To enable it for one request, set `enable_thinking` to `true` in `chat_template_kwargs`.
 
-Use non-thinking mode for tool calling with `--tool-call-parser apertus` and
-`--enable-auto-tool-choice`. By default, structured output constraints wait for
-the end of reasoning when `include_reasoning` is enabled. An answer without a
-reasoning boundary can bypass those constraints.
+Use non-thinking mode for tool calling with `--tool-call-parser apertus` and `--enable-auto-tool-choice`. By default, structured output constraints wait for the end of reasoning when `include_reasoning` is enabled. An answer without a reasoning boundary can bypass those constraints.
 
 ## Quickstart
 
