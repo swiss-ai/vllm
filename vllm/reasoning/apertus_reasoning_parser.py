@@ -3,7 +3,6 @@
 """Reasoning parser for Apertus deliberation and tool handoff."""
 
 from collections.abc import Iterable, Sequence
-from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
@@ -15,13 +14,6 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 INNER_PREFIX, INNER_SUFFIX = "<|inner_prefix|>", "<|inner_suffix|>"
-THINKING_START, THINKING_END = "<think>", "</think>"
-
-_CANDIDATE_PAIRS = (
-    (INNER_PREFIX, INNER_SUFFIX),
-    (THINKING_START, THINKING_END),
-)
-
 TOOLS_PREFIX = "<|tools_prefix|>"
 TURN_MARKERS = (
     "<|assistant_start|>",
@@ -32,21 +24,8 @@ TURN_MARKERS = (
 )
 
 
-def _after_tool(request: "ChatCompletionRequest | ResponsesRequest") -> bool:
-    messages = getattr(request, "messages", None)
-    if not messages:
-        return False
-    last_message = messages[-1]
-    role = (
-        last_message.get("role")
-        if isinstance(last_message, dict)
-        else getattr(last_message, "role", None)
-    )
-    return role == "tool"
-
-
 class ApertusReasoningParser(BaseThinkingReasoningParser):
-    """Parse Apertus deliberation with either tokenizer's delimiter scheme."""
+    """Parse Apertus deliberation and its handoff to tool calls."""
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs) -> None:
         super().__init__(tokenizer, *args, **kwargs)
@@ -54,28 +33,13 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
         self.turn_ids = {self.vocab[t] for t in TURN_MARKERS if t in self.vocab}
         self.open_from_prompt = False
 
-    @cached_property
-    def _delimiter_pair(self) -> tuple[str, str]:
-        vocab = self.vocab
-        pairs = (
-            (start, end)
-            for start, end in _CANDIDATE_PAIRS
-            if start in vocab and end in vocab
-        )
-        # Match the tokenizer plugin's ordering, including ties.
-        return min(
-            pairs,
-            key=lambda pair: (vocab[pair[0]], pair),
-            default=_CANDIDATE_PAIRS[0],
-        )
-
     @property
     def start_token(self) -> str:
-        return self._delimiter_pair[0]
+        return INNER_PREFIX
 
     @property
     def end_token(self) -> str:
-        return self._delimiter_pair[1]
+        return INNER_SUFFIX
 
     def _get_last_marker(
         self, input_ids: Sequence[int]
@@ -96,9 +60,6 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
     def set_prompt_token_ids(self, prompt_token_ids: Sequence[int]) -> None:
         self.open_from_prompt = self._get_last_marker(prompt_token_ids) == "open"
 
-    def adjust_initial_state_from_prompt(self, prompt_token_ids: Sequence[int]) -> None:
-        self.set_prompt_token_ids(prompt_token_ids)
-
     def extract_reasoning(
         self, model_output: str, request: "ChatCompletionRequest | ResponsesRequest"
     ) -> tuple[str | None, str | None]:
@@ -113,10 +74,6 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
         index = text.find(TOOLS_PREFIX)
         if index >= 0:
             return text[:index] or None, text[index:]
-        # After a tool result the model often answers without closing a section
-        # the prompt left open; that text is the answer.
-        if not start and _after_tool(request):
-            return None, text or None
         return text or None, None
 
     def is_reasoning_end_streaming(
@@ -179,17 +136,3 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
             current_token_ids,
             delta_token_ids,
         )
-
-    def get_streaming_fallback_content(
-        self, previous_text: str, request: "ChatCompletionRequest | ResponsesRequest"
-    ) -> str | None:
-        """Recover an unmarked post-tool answer from prompt-open reasoning."""
-        # A fresh turn already streams unmarked text as content.
-        if (
-            not self.open_from_prompt
-            or not _after_tool(request)
-            or self.start_token in previous_text
-            or TOOLS_PREFIX in previous_text
-        ):
-            return None
-        return previous_text.replace(self.end_token, "").strip() or None
