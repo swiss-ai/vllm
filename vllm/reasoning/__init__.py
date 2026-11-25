@@ -20,6 +20,10 @@ Example:
 
 
 _REASONING_PARSERS_TO_REGISTER = {
+    "apertus": (
+        "apertus_reasoning_parser",
+        "ApertusReasoningParser",
+    ),
     "deepseek_r1": (  # name
         "deepseek_r1_reasoning_parser",  # filename
         "DeepSeekR1ReasoningParser",  # class_name
@@ -153,21 +157,25 @@ _REASONING_PARSERS_TO_REGISTER = {
         "Plamo3ParserReasoningAdapter",
     ),
     "muse": (
-        "muse_reasoning_parser",
-        "MuseReasoningParser",
+        "muse_engine_reasoning_parser",
+        "MuseEngineReasoningParser",
     ),
     "muse_glimmer": (
         "muse_glimmer_reasoning_parser",
         "MuseGlimmerReasoningParser",
     ),
     # Alias of "muse".
-    "musespark1x": (
-        "muse_reasoning_parser",
-        "MuseReasoningParser",
+    "musespark": (
+        "muse_engine_reasoning_parser",
+        "MuseEngineReasoningParser",
     ),
     "qwen3": (
         "qwen3_engine_reasoning_parser",
         "Qwen3ParserReasoningAdapter",
+    ),
+    "ripple": (
+        "ripple_engine_reasoning_parser",
+        "RippleParserReasoningAdapter",
     ),
     "seed_oss": (
         "seed_oss_engine_reasoning_parser",
