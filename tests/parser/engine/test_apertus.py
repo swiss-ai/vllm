@@ -66,10 +66,10 @@ def _tokenize(text: str) -> list[tuple[int, str]]:
 
 
 def _run(prompt: str, output: str, mode: str, tools: bool = True):
-    """Parse ``output`` after ``prompt``.
+    """Parse `output` after `prompt`.
 
-    ``mode`` is ``full`` or ``stream-<chunk size>``, through the parser the
-    serving layer composes; an ``engine-`` prefix uses the engine directly.
+    `mode` is `full` or `stream-<chunk size>`, through the parser the
+    serving layer composes; an `engine-` prefix uses the engine directly.
     """
     request = ChatCompletionRequest(
         model="test-model",
@@ -238,7 +238,7 @@ def test_apertus_parsing(prompt, output, expected, mode):
 
 @pytest.mark.parametrize("mode", SERVING_MODES)
 def test_reasoning_without_tool_parser(mode):
-    """``--reasoning-parser apertus`` alone must still split the model's own
+    """`--reasoning-parser apertus` alone must still split the model's own
     deliberation block after a fresh turn."""
     output = f"{INNER_PREFIX}Thought{INNER_SUFFIX}Answer"
     assert _run(ASSISTANT_START, output, mode, tools=False) == (

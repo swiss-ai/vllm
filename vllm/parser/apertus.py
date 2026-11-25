@@ -2,14 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Apertus parser for deliberation and tool calls.
 
-Apertus deliberates between ``<|inner_prefix|>`` and ``<|inner_suffix|>`` and
+Apertus deliberates between `<|inner_prefix|>` and `<|inner_suffix|>` and
 calls tools with a JSON array of single-key objects::
 
     <|inner_prefix|>Check<|tools_prefix|>[{"get_time": {"zone": "CET"}}]<|tools_suffix|>
 
 A tool call ends the deliberation, so the model may call tools from inside it
-without emitting ``<|inner_suffix|>``. The tool output then continues inside the
-open block, so in the prompt only ``<|inner_suffix|>`` or a turn marker closes it.
+without emitting `<|inner_suffix|>`. The tool output then continues inside the
+open block, so in the prompt only `<|inner_suffix|>` or a turn marker closes it.
 """
 
 from __future__ import annotations
@@ -149,7 +149,7 @@ class ApertusParser(ParserEngine):
                 return None
         return None
 
-    def is_reasoning_end(self, input_ids: list[int]) -> bool:
+    def is_reasoning_end(self, input_ids: Sequence[int]) -> bool:
         # Unlike the engine default, a tool call does not close the block here:
         # its output continues inside the deliberation.
         return self._last_marker(input_ids) == "closed"
