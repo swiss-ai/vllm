@@ -38,10 +38,7 @@ def _after_tool(request: "ChatCompletionRequest | ResponsesRequest") -> bool:
 
 
 class ApertusReasoningParser(BaseThinkingReasoningParser):
-    """Parse Apertus deliberation delimited by `<|inner_prefix|>`/`<|inner_suffix|>`.
-
-    The Apertus 1.5 tokenizer normalizes `<think>`/`</think>` to these delimiters.
-    """
+    """Parse Apertus deliberation delimited by `<|inner_prefix|>`/`<|inner_suffix|>`."""
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs) -> None:
         super().__init__(tokenizer, *args, **kwargs)
