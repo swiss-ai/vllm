@@ -3,7 +3,6 @@
 """Reasoning parser for Apertus deliberation and tool handoff."""
 
 from collections.abc import Iterable, Sequence
-from functools import cached_property
 from typing import TYPE_CHECKING, Literal
 
 from vllm.entrypoints.generate.base.protocol import DeltaMessage
@@ -15,13 +14,6 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.responses.protocol import ResponsesRequest
 
 INNER_PREFIX, INNER_SUFFIX = "<|inner_prefix|>", "<|inner_suffix|>"
-THINKING_START, THINKING_END = "<think>", "</think>"
-
-_CANDIDATE_PAIRS = (
-    (INNER_PREFIX, INNER_SUFFIX),
-    (THINKING_START, THINKING_END),
-)
-
 TOOLS_PREFIX = "<|tools_prefix|>"
 TURN_MARKERS = (
     "<|assistant_start|>",
@@ -46,7 +38,7 @@ def _after_tool(request: "ChatCompletionRequest | ResponsesRequest") -> bool:
 
 
 class ApertusReasoningParser(BaseThinkingReasoningParser):
-    """Parse Apertus deliberation with either tokenizer's delimiter scheme."""
+    """Parse Apertus deliberation delimited by `<|inner_prefix|>`/`<|inner_suffix|>`."""
 
     def __init__(self, tokenizer: TokenizerLike, *args, **kwargs) -> None:
         super().__init__(tokenizer, *args, **kwargs)
@@ -54,28 +46,13 @@ class ApertusReasoningParser(BaseThinkingReasoningParser):
         self.turn_ids = {self.vocab[t] for t in TURN_MARKERS if t in self.vocab}
         self.open_from_prompt = False
 
-    @cached_property
-    def _delimiter_pair(self) -> tuple[str, str]:
-        vocab = self.vocab
-        pairs = (
-            (start, end)
-            for start, end in _CANDIDATE_PAIRS
-            if start in vocab and end in vocab
-        )
-        # Match the tokenizer plugin's ordering, including ties.
-        return min(
-            pairs,
-            key=lambda pair: (vocab[pair[0]], pair),
-            default=_CANDIDATE_PAIRS[0],
-        )
-
     @property
     def start_token(self) -> str:
-        return self._delimiter_pair[0]
+        return INNER_PREFIX
 
     @property
     def end_token(self) -> str:
-        return self._delimiter_pair[1]
+        return INNER_SUFFIX
 
     def _get_last_marker(
         self, input_ids: Sequence[int]

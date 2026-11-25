@@ -14,13 +14,10 @@ from vllm.parser import ParserManager
 from vllm.reasoning.apertus_reasoning_parser import (
     INNER_PREFIX,
     INNER_SUFFIX,
-    THINKING_END,
-    THINKING_START,
     ApertusReasoningParser,
 )
 
 INNER = (INNER_PREFIX, INNER_SUFFIX)
-THINK = (THINKING_START, THINKING_END)
 ASSISTANT_START = "<|assistant_start|>"
 TOOLS_START, TOOLS_END = "<|tools_prefix|>", "<|tools_suffix|>"
 TOOL_PAYLOAD = '[{"get_weather": {"city": "Bern"}}]'
@@ -37,21 +34,16 @@ def make_tokenizer(markers: tuple[str, ...]) -> TokenizersBackend:
 
 @pytest.fixture
 def apertus_tokenizer() -> TokenizersBackend:
-    return make_tokenizer(INNER + THINK)
+    return make_tokenizer(INNER)
 
 
-@pytest.mark.parametrize(
-    "active, inactive, streaming",
-    [
-        pytest.param(INNER, THINK, True, id="inner-stream"),
-        pytest.param(THINK, INNER, False, id="think-full"),
-    ],
-)
-def test_emitted_delimiters(active, inactive, streaming):
-    tokenizer = make_tokenizer(active + inactive)
+@pytest.mark.parametrize("streaming", [True, False])
+def test_think_tags_do_not_delimit_reasoning(streaming):
+    # `<think>` gets the lower ids here, as in the Apertus 1 base vocabulary.
+    tokenizer = make_tokenizer(("<think>", "</think>", *INNER))
     parser = ApertusReasoningParser(tokenizer)
-    answer = f"{inactive[0]}Answer{inactive[1]}"
-    output = [active[0], "Thought", active[1], answer]
+    answer = "<think>Answer</think>"
+    output = [INNER_PREFIX, "Thought", INNER_SUFFIX, answer]
 
     assert run_reasoning_extraction(parser, output, streaming=streaming) == (
         "Thought",
@@ -64,7 +56,7 @@ def test_emitted_delimiters(active, inactive, streaming):
     completed_reasoning_ids = tokenizer.encode("".join(output[:3]))
     if streaming:
         assert parser.is_reasoning_end_streaming(
-            completed_reasoning_ids, tokenizer.encode(active[1])
+            completed_reasoning_ids, tokenizer.encode(INNER_SUFFIX)
         )
     else:
         assert parser.is_reasoning_end(completed_reasoning_ids)
